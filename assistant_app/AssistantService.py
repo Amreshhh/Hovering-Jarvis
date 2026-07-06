@@ -20,7 +20,6 @@ from nltk.corpus import wordnet
 from groq import Groq
 from google import genai
 from google.genai import types
-from duckduckgo_search import DDGS
 import openwakeword
 from openwakeword.model import Model
 import pyaudio
@@ -44,6 +43,7 @@ class AssistantService:
         logging.getLogger("openwakeword").setLevel(logging.ERROR)
 
         self.state_lock = threading.Lock()
+        self.query_lock = threading.Lock()
         self.is_widget_open = False
         self.dictation_enabled = True
         self.barge_in_triggered = False
@@ -165,122 +165,61 @@ class AssistantService:
         self._remember_exchange(user_text, answer)
         return answer
 
-    def get_ddg_ai_response(self, user_text):
-        def build_query_candidates(text):
-            cleaned = re.sub(
-                r"^what\s+is\s+the\s+|^what's\s+the\s+|^who\s+is\s+the\s+|^who\s+is\s+|^tell\s+me\s+the\s+",
-                "",
-                text.lower().strip(),
-            )
-            cleaned = cleaned.rstrip("?.!, ")
-            candidates = [text.strip()]
-            if cleaned and cleaned != text.strip().lower():
-                candidates.append(cleaned)
-            return candidates
-
-        def summarize_results(results):
-            if not results:
-                return None
-
-            snippets = []
-            for item in results[:2]:
-                title = (item.get("title") or "").strip()
-                snippet = (item.get("body") or item.get("snippet") or "").strip()
-                href = (item.get("href") or item.get("url") or "").strip()
-
-                if snippet:
-                    snippets.append(snippet)
-                elif title:
-                    snippets.append(title)
-
-                if href:
-                    snippets.append(f"Source: {href}")
-
-            answer = " ".join(snippets).strip()
-            return answer or None
-
-        last_error = None
-        for query in build_query_candidates(user_text):
-            for backend in ("html", "lite", None):
-                try:
-                    with DDGS() as ddgs:
-                        if backend:
-                            results = list(ddgs.text(query, max_results=3, backend=backend))
-                        else:
-                            results = list(ddgs.text(query, max_results=3))
-
-                    answer = summarize_results(results)
-                    if answer:
-                        self._remember_exchange(user_text, answer)
-                        return answer
-                except Exception as exc:
-                    last_error = exc
-
-        if last_error:
-            raise ValueError(f"DuckDuckGo lookup failed: {last_error}")
-        raise ValueError("DuckDuckGo returned no usable result.")
-
     def process_query_master(self, user_text):
-        if not self.check_internet():
+        with self.query_lock:
+            if not self.check_internet():
+                answer = self.get_offline_definition(user_text)
+                return answer if answer else "System is offline. Local database returned empty content."
+
+            active_groqs = [node for node in self.groq_clients if self.key_fail_counts[node["id"]] < 2]
+            active_geminis = [node for node in self.gemini_clients if self.key_fail_counts[node["id"]] < 2]
+
+            if not active_groqs:
+                for node in self.groq_clients:
+                    self.key_fail_counts[node["id"]] = 0
+                active_groqs = list(self.groq_clients)
+
+            if not active_geminis:
+                for node in self.gemini_clients:
+                    self.key_fail_counts[node["id"]] = 0
+                active_geminis = list(self.gemini_clients)
+
+            random.shuffle(active_groqs)
+            random.shuffle(active_geminis)
+
+            for index, node in enumerate(active_groqs):
+                if self.barge_in_triggered:
+                    return None
+                timeout_val = 5.0 if index == 0 else 6.0
+                try:
+                    self.log(f"Attempting {node['id']} ({timeout_val}s limit)...", "INFO")
+                    answer = self.run_with_timeout(
+                        self.get_groq_response,
+                        timeout_val,
+                        node["client"],
+                        user_text,
+                        timeout_val,
+                    )
+                    self.key_fail_counts[node["id"]] = 0
+                    return answer
+                except Exception as exc:
+                    self.key_fail_counts[node["id"]] += 1
+                    self.log(f"{node['id']} Failed: {exc}", "ERROR")
+
+            for node in active_geminis:
+                if self.barge_in_triggered:
+                    return None
+                try:
+                    self.log(f"Attempting {node['id']} (4.0s limit)...", "INFO")
+                    answer = self.run_with_timeout(self.get_gemini_response, 4.0, node["client"], user_text)
+                    self.key_fail_counts[node["id"]] = 0
+                    return answer
+                except Exception as exc:
+                    self.key_fail_counts[node["id"]] += 1
+                    self.log(f"{node['id']} Failed: {exc}", "ERROR")
+
             answer = self.get_offline_definition(user_text)
-            return answer if answer else "System is offline. Local database returned empty content."
-
-        active_groqs = [node for node in self.groq_clients if self.key_fail_counts[node["id"]] < 2]
-        active_geminis = [node for node in self.gemini_clients if self.key_fail_counts[node["id"]] < 2]
-
-        if not active_groqs:
-            for node in self.groq_clients:
-                self.key_fail_counts[node["id"]] = 0
-            active_groqs = list(self.groq_clients)
-
-        if not active_geminis:
-            for node in self.gemini_clients:
-                self.key_fail_counts[node["id"]] = 0
-            active_geminis = list(self.gemini_clients)
-
-        random.shuffle(active_groqs)
-        random.shuffle(active_geminis)
-
-        for index, node in enumerate(active_groqs):
-            if self.barge_in_triggered:
-                return None
-            timeout_val = 5.0 if index == 0 else 6.0
-            try:
-                self.log(f"Attempting {node['id']} ({timeout_val}s limit)...", "INFO")
-                answer = self.run_with_timeout(
-                    self.get_groq_response,
-                    timeout_val,
-                    node["client"],
-                    user_text,
-                    timeout_val,
-                )
-                self.key_fail_counts[node["id"]] = 0
-                return answer
-            except Exception as exc:
-                self.key_fail_counts[node["id"]] += 1
-                self.log(f"{node['id']} Failed: {exc}", "ERROR")
-
-        if not self.barge_in_triggered:
-            try:
-                self.log("Routing request to DuckDuckGo Public Layer...", "INFO")
-                return self.run_with_timeout(self.get_ddg_ai_response, 8.0, user_text)
-            except Exception as ddg_err:
-                self.log(f"DuckDuckGo Public Layer Failed: {ddg_err}", "ERROR")
-
-        for node in active_geminis:
-            if self.barge_in_triggered:
-                return None
-            try:
-                self.log(f"Attempting {node['id']} (4.0s limit)...", "INFO")
-                answer = self.run_with_timeout(self.get_gemini_response, 4.0, node["client"], user_text)
-                self.key_fail_counts[node["id"]] = 0
-                return answer
-            except Exception as exc:
-                self.key_fail_counts[node["id"]] += 1
-                self.log(f"{node['id']} Failed: {exc}", "ERROR")
-
-        answer = self.get_offline_definition(user_text)
-        return answer if answer else "All network nodes and search fallback clusters are unreachable."
+            return answer if answer else "All network nodes and search fallback clusters are unreachable."
 
     def transcribe_audio(self, audio_capture):
         if self.check_internet():
@@ -322,6 +261,7 @@ class AssistantService:
                 on_ready_callback(output_file)
             except Exception as exc:
                 self.log(f"Offline TTS failed: {exc}", "ERROR")
+                on_ready_callback(None)
 
         target = write_online if self.check_internet() else write_offline
         threading.Thread(target=target, daemon=True).start()

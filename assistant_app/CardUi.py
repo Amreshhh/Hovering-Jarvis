@@ -116,6 +116,7 @@ class AssistantHUD:
         r_idx = [0]
         response_render_complete = [False]
         audio_playback_complete = [not self.service.dictation_enabled]
+        response_step = 3
 
         def activate_listening_ui(is_first=False):
             if self.service.barge_in_triggered:
@@ -145,6 +146,7 @@ class AssistantHUD:
             if self.service.dictation_enabled:
                 response_label.configure(text="Thinking...█")
                 self.service.generate_audio(a_str, on_audio_ready)
+                type_response()
             else:
                 response_label.configure(text="")
                 type_response()
@@ -152,28 +154,28 @@ class AssistantHUD:
         def on_audio_ready(filepath):
             if self.service.barge_in_triggered:
                 return
-            self._safe_gui(response_label.configure, text="")
-            self.service.play_and_cleanup(filepath, audio_finished_callback)
-            self._safe_gui(type_response)
+            if filepath:
+                self.service.play_and_cleanup(filepath, audio_finished_callback)
+            else:
+                audio_finished_callback()
 
         def type_response():
             if self.service.barge_in_triggered:
                 return
             if r_idx[0] < len(a_str):
-                current_text = a_str[: r_idx[0] + 1]
+                next_index = min(r_idx[0] + response_step, len(a_str))
+                current_text = a_str[:next_index]
                 self._update_height(len(current_text))
                 response_label.configure(text=current_text + "█")
-                r_idx[0] += 1
-                delay = 120 if a_str[r_idx[0] - 1] in [".", "!", "?"] else 40
+                r_idx[0] = next_index
+                last_char = a_str[next_index - 1]
+                delay = 70 if last_char in [".", "!", "?"] else 15
                 self.root.after(delay, type_response)
             else:
                 response_label.configure(text=a_str)
                 response_render_complete[0] = True
                 if not self.service.barge_in_triggered:
-                    if not self.service.dictation_enabled:
-                        self.root.after(500, finalize_response_stage)
-                    else:
-                        finalize_response_stage()
+                    finalize_response_stage()
 
         def audio_finished_callback():
             if not self.service.barge_in_triggered:

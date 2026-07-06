@@ -26,9 +26,8 @@ The lifecycle of a single user interaction follows a strict, sequential pipeline
 - Transcription: The spoken query is captured, transcribed to text, and sent to process_query_master().
 - Waterfall Routing: The query is routed through a prioritized pipeline to ensure a response even if primary nodes fail. The priority is:
 	- Tier 1: Groq Clients (Fastest)
-	- Tier 2: DuckDuckGo Chat (Public Web Fallback)
-	- Tier 3: Gemini Clients (Secondary LLM)
-	- Tier 4: Offline WordNet (Local Database Fallback)
+	- Tier 2: Gemini Clients (Secondary LLM)
+	- Tier 3: Offline WordNet (Local Database Fallback)
 
 ### Phase 4: Output and Reset
 - Display and Speak: The HUD visually types out the query and the generated answer. Simultaneously, it plays the generated TTS audio.
