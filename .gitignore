@@ -11,3 +11,6 @@ __pycache__/
 # Ignore OS-specific system files
 .DS_Store
 Thumbs.db
+
+# Ignore ui file
+ui.html
