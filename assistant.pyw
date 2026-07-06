@@ -15,12 +15,10 @@ import edge_tts
 import pygame
 
 # --- 1. CONFIGURATION ---
-WAKE_WORD = "alexa"
-
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# Pull the user's name from the .env file, default to "User" if missing
 USER_NAME = os.getenv("USER_NAME", "User") 
+WAKE_WORD = os.getenv("WAKE_WORD", "alexa").lower() # Dynamic wake word tracking
 
 if not GEMINI_API_KEY:
     print("CRITICAL ERROR: API Key missing in .env file.")
@@ -39,38 +37,32 @@ mic_stream = audio.open(format=pyaudio.paInt16, channels=1, rate=16000,
 
 is_widget_open = False
 
-# --- 2. SYNCHRONIZED AUDIO ENGINE ---
+# --- 2. AUDIO PIPELINE ---
 def generate_audio(text, on_ready_callback):
     def task():
         voice = "en-US-GuyNeural"
         output_file = "temp_response.mp3"
-        
         communicate = edge_tts.Communicate(text, voice)
         asyncio.run(communicate.save(output_file))
         on_ready_callback(output_file)
-        
     threading.Thread(target=task, daemon=True).start()
 
 def play_and_cleanup(filepath, on_complete_callback):
     def task():
         pygame.mixer.music.load(filepath)
         pygame.mixer.music.play()
-        
         while pygame.mixer.music.get_busy():
             time.sleep(0.05)
-            
         pygame.mixer.music.unload()
         try:
             os.remove(filepath)
         except OSError:
             pass
-            
         if on_complete_callback:
             on_complete_callback()
-            
     threading.Thread(target=task, daemon=True).start()
 
-# --- 3. DRAGGABLE NATIVE HUD ---
+# --- 3. DYNAMIC DRAGGABLE TERMINAL HUD ---
 def display_response(initial_query, initial_answer):
     global is_widget_open
     is_widget_open = True
@@ -78,6 +70,7 @@ def display_response(initial_query, initial_answer):
     root = ctk.CTk()
     root.overrideredirect(True)
     root.attributes("-topmost", True)
+    
     TRANSPARENT_COLOR = "#000001"
     root.wm_attributes("-transparentcolor", TRANSPARENT_COLOR)
     root.configure(fg_color=TRANSPARENT_COLOR)
@@ -92,7 +85,6 @@ def display_response(initial_query, initial_answer):
         "drag_y": 0
     }
     
-    # Increased base height slightly to protect bottom rounded corners
     root.geometry(f"{window_width}x130+{pos['x']}+{pos['y']}")
 
     def start_move(event):
@@ -106,10 +98,24 @@ def display_response(initial_query, initial_answer):
         pos["y"] = root.winfo_y() + deltay
         root.geometry(f"+{pos['x']}+{pos['y']}")
 
-    panel = ctk.CTkFrame(root, corner_radius=12, fg_color="#1E1E1E", bg_color=TRANSPARENT_COLOR, border_width=1, border_color="#333333")
+    # STYLING STABILIZATION: Outer container frame has background rendering protections 
+    panel = ctk.CTkFrame(
+        root, 
+        corner_radius=14, 
+        fg_color="#1E1E1E", 
+        bg_color=TRANSPARENT_COLOR, 
+        border_width=1, 
+        border_color="#333333"
+    )
     panel.pack(fill="both", expand=True, padx=12, pady=12)
 
-    toolbar = ctk.CTkFrame(panel, corner_radius=10, fg_color="#2D2D2D", height=35)
+    # FIXED: Toolbar corner radius matches top contour edges exactly to eliminate clipping artifacts
+    toolbar = ctk.CTkFrame(
+        panel, 
+        corner_radius=14, 
+        fg_color="#2D2D2D", 
+        height=35
+    )
     toolbar.pack(fill="x", padx=0, pady=0)
     toolbar.pack_propagate(False) 
 
@@ -122,7 +128,6 @@ def display_response(initial_query, initial_answer):
     for color in ["#FF5F56", "#FFBD2E", "#27C93F"]:
         ctk.CTkFrame(btn_frame, width=12, height=12, corner_radius=6, fg_color=color).pack(side="left", padx=4)
 
-    # Dynamic Toolbar Name
     ctk.CTkLabel(toolbar, text=f"{USER_NAME}: ~", font=("Consolas", 12, "bold"), text_color="#FFFFFF").pack(side="left", padx=25)
     
     mic_btn = ctk.CTkButton(
@@ -134,14 +139,12 @@ def display_response(initial_query, initial_answer):
 
     body = ctk.CTkFrame(panel, fg_color="transparent")
     body.pack(fill="both", expand=True, padx=15, pady=10)
-
     body.bind("<ButtonPress-1>", start_move)
     body.bind("<B1-Motion>", move_window)
 
     prompt_frame = ctk.CTkFrame(body, fg_color="transparent")
     prompt_frame.pack(fill="x", anchor="w")
     
-    # Dynamic Prompt Name
     ctk.CTkLabel(prompt_frame, text=f"{USER_NAME}:", font=("Consolas", 13, "bold"), text_color="#00FF9C").pack(side="left")
     ctk.CTkLabel(prompt_frame, text="~", font=("Consolas", 13, "bold"), text_color="#0066FF").pack(side="left", padx=(6,0))
     ctk.CTkLabel(prompt_frame, text="$", font=("Consolas", 13, "bold"), text_color="#FF00FF").pack(side="left", padx=(6,10))
@@ -156,8 +159,7 @@ def display_response(initial_query, initial_answer):
 
     def update_height(text_len):
         lines = (text_len // 50) + 1
-        # Added a 15px buffer to the height math to prevent clipping the bottom corners
-        new_height = 125 + (lines * 22) 
+        new_height = 135 + (lines * 22) 
         root.geometry(f"{window_width}x{new_height}+{pos['x']}+{pos['y']}")
 
     def safe_close():
@@ -181,7 +183,6 @@ def display_response(initial_query, initial_answer):
         query_label.configure(text="")
         response_label.configure(text="")
         
-        # Dynamic Greeting Logic
         if not is_followup:
             a_str = f"Hey {USER_NAME}, {a_str}"
             
@@ -252,8 +253,8 @@ def display_response(initial_query, initial_answer):
     root.after(10, lambda: run_sequence(initial_query, initial_answer, is_followup=False))
     root.mainloop()
 
-# --- 4. MAIN WAKE LOOP ---
-print(f"Agent initialized for {USER_NAME}. Draggable HUD and dynamic corners operational.")
+# --- 4. ENGINE RUNTIME INTERCEPTOR ---
+print(f"Agent running. Tracking User: '{USER_NAME}' | Wake Phrase: '{WAKE_WORD}'")
 
 while True:
     try:
@@ -266,7 +267,7 @@ while True:
             prediction = model.predict(audio_frame)
             
             if model.prediction_buffer[WAKE_WORD][-1] > 0.5:
-                print("\n[Trigger] Main wake event...")
+                print(f"\n[Trigger] Detected wake phrase: '{WAKE_WORD}'")
                 mic_stream.stop_stream()
                 
                 with sr.Microphone() as source:
@@ -287,7 +288,7 @@ while True:
                         display_response(user_question, response.text)
                             
                     except Exception as e:
-                        print(f"Error: {e}")
+                        print(f"Error processing question: {e}")
                 model.reset()
                 time.sleep(1)
         else:
