@@ -1,5 +1,4 @@
 import time
-import random
 import os
 import asyncio
 import threading
@@ -20,9 +19,11 @@ WAKE_WORD = "alexa"
 
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Pull the user's name from the .env file, default to "User" if missing
+USER_NAME = os.getenv("USER_NAME", "User") 
 
 if not GEMINI_API_KEY:
-    print("CRITICAL ERROR: API Key missing.")
+    print("CRITICAL ERROR: API Key missing in .env file.")
     exit(1)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -36,33 +37,40 @@ audio = pyaudio.PyAudio()
 mic_stream = audio.open(format=pyaudio.paInt16, channels=1, rate=16000, 
                         input=True, frames_per_buffer=1280)
 
-# Global flag to signal background main loop status
 is_widget_open = False
 
-# --- 2. INSTANT AUDIO MIXER ---
-def pre_generate_and_play_audio(text, callback=None):
-    voice = "en-US-GuyNeural"
-    output_file = "temp_response.mp3"
-    
-    communicate = edge_tts.Communicate(text, voice)
-    asyncio.run(communicate.save(output_file))
-    
-    def play_loop():
-        pygame.mixer.music.load(output_file)
+# --- 2. SYNCHRONIZED AUDIO ENGINE ---
+def generate_audio(text, on_ready_callback):
+    def task():
+        voice = "en-US-GuyNeural"
+        output_file = "temp_response.mp3"
+        
+        communicate = edge_tts.Communicate(text, voice)
+        asyncio.run(communicate.save(output_file))
+        on_ready_callback(output_file)
+        
+    threading.Thread(target=task, daemon=True).start()
+
+def play_and_cleanup(filepath, on_complete_callback):
+    def task():
+        pygame.mixer.music.load(filepath)
         pygame.mixer.music.play()
+        
         while pygame.mixer.music.get_busy():
             time.sleep(0.05)
+            
         pygame.mixer.music.unload()
         try:
-            os.remove(output_file)
+            os.remove(filepath)
         except OSError:
             pass
-        if callback:
-            callback()
+            
+        if on_complete_callback:
+            on_complete_callback()
+            
+    threading.Thread(target=task, daemon=True).start()
 
-    threading.Thread(target=play_loop, daemon=True).start()
-
-# --- 3. NATIVE TERMINAL HUD WITH LISTEN BUTTON ---
+# --- 3. DRAGGABLE NATIVE HUD ---
 def display_response(initial_query, initial_answer):
     global is_widget_open
     is_widget_open = True
@@ -76,35 +84,50 @@ def display_response(initial_query, initial_answer):
     
     window_width = 440
     screen_width = root.winfo_screenwidth()
-    x_coordinate = screen_width - window_width - 25
-    y_coordinate = 60 
-    root.geometry(f"{window_width}x110+{x_coordinate}+{y_coordinate}")
+    
+    pos = {
+        "x": screen_width - window_width - 25,
+        "y": 60,
+        "drag_x": 0,
+        "drag_y": 0
+    }
+    
+    # Increased base height slightly to protect bottom rounded corners
+    root.geometry(f"{window_width}x130+{pos['x']}+{pos['y']}")
 
-    panel = ctk.CTkFrame(root, corner_radius=10, fg_color="#1E1E1E", bg_color=TRANSPARENT_COLOR, border_width=1, border_color="#333333")
-    panel.pack(fill="both", expand=True, padx=10, pady=10)
+    def start_move(event):
+        pos["drag_x"] = event.x
+        pos["drag_y"] = event.y
+
+    def move_window(event):
+        deltax = event.x - pos["drag_x"]
+        deltay = event.y - pos["drag_y"]
+        pos["x"] = root.winfo_x() + deltax
+        pos["y"] = root.winfo_y() + deltay
+        root.geometry(f"+{pos['x']}+{pos['y']}")
+
+    panel = ctk.CTkFrame(root, corner_radius=12, fg_color="#1E1E1E", bg_color=TRANSPARENT_COLOR, border_width=1, border_color="#333333")
+    panel.pack(fill="both", expand=True, padx=12, pady=12)
 
     toolbar = ctk.CTkFrame(panel, corner_radius=10, fg_color="#2D2D2D", height=35)
     toolbar.pack(fill="x", padx=0, pady=0)
     toolbar.pack_propagate(False) 
+
+    for widget in (toolbar, panel):
+        widget.bind("<ButtonPress-1>", start_move)
+        widget.bind("<B1-Motion>", move_window)
 
     btn_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
     btn_frame.pack(side="left", padx=12)
     for color in ["#FF5F56", "#FFBD2E", "#27C93F"]:
         ctk.CTkFrame(btn_frame, width=12, height=12, corner_radius=6, fg_color=color).pack(side="left", padx=4)
 
-    ctk.CTkLabel(toolbar, text="Tony: ~", font=("Consolas", 12, "bold"), text_color="#FFFFFF").pack(side="left", padx=25)
+    # Dynamic Toolbar Name
+    ctk.CTkLabel(toolbar, text=f"{USER_NAME}: ~", font=("Consolas", 12, "bold"), text_color="#FFFFFF").pack(side="left", padx=25)
     
-    # NEW: Voice status mic icon button on the toolbar right side
     mic_btn = ctk.CTkButton(
-        toolbar, 
-        text="● Mic Off", 
-        font=("Consolas", 11, "bold"), 
-        text_color="#AAAAAA",
-        fg_color="#3A3A3A", 
-        hover_color="#4A4A4A",
-        corner_radius=5, 
-        width=75, 
-        height=24,
+        toolbar, text="● Mic Off", font=("Consolas", 11, "bold"), text_color="#AAAAAA",
+        fg_color="#3A3A3A", hover_color="#4A4A4A", corner_radius=5, width=75, height=24,
         command=lambda: trigger_followup()
     )
     mic_btn.pack(side="right", padx=10)
@@ -112,26 +135,30 @@ def display_response(initial_query, initial_answer):
     body = ctk.CTkFrame(panel, fg_color="transparent")
     body.pack(fill="both", expand=True, padx=15, pady=10)
 
+    body.bind("<ButtonPress-1>", start_move)
+    body.bind("<B1-Motion>", move_window)
+
     prompt_frame = ctk.CTkFrame(body, fg_color="transparent")
     prompt_frame.pack(fill="x", anchor="w")
     
-    ctk.CTkLabel(prompt_frame, text="Tony:", font=("Consolas", 13, "bold"), text_color="#00FF9C").pack(side="left")
+    # Dynamic Prompt Name
+    ctk.CTkLabel(prompt_frame, text=f"{USER_NAME}:", font=("Consolas", 13, "bold"), text_color="#00FF9C").pack(side="left")
     ctk.CTkLabel(prompt_frame, text="~", font=("Consolas", 13, "bold"), text_color="#0066FF").pack(side="left", padx=(6,0))
     ctk.CTkLabel(prompt_frame, text="$", font=("Consolas", 13, "bold"), text_color="#FF00FF").pack(side="left", padx=(6,10))
 
     query_label = ctk.CTkLabel(prompt_frame, text="", font=("Consolas", 13), text_color="#FFFFFF")
     query_label.pack(side="left")
 
-    response_label = ctk.CTkLabel(body, text="", font=("Consolas", 13), text_color="#CCCCCC", justify="left", wraplength=380)
+    response_label = ctk.CTkLabel(body, text="", font=("Consolas", 13), text_color="#CCCCCC", justify="left", wraplength=370)
     response_label.pack(anchor="w", pady=(10, 0))
 
-    # Auto-close timer variable that we can reset
     close_timer_id = [None]
 
     def update_height(text_len):
         lines = (text_len // 50) + 1
-        new_height = 110 + (lines * 22) 
-        root.geometry(f"{window_width}x{new_height}+{x_coordinate}+{y_coordinate}")
+        # Added a 15px buffer to the height math to prevent clipping the bottom corners
+        new_height = 125 + (lines * 22) 
+        root.geometry(f"{window_width}x{new_height}+{pos['x']}+{pos['y']}")
 
     def safe_close():
         global is_widget_open
@@ -146,8 +173,7 @@ def display_response(initial_query, initial_answer):
             root.after_cancel(close_timer_id[0])
         close_timer_id[0] = root.after(seconds * 1000, safe_close)
 
-    # --- THE RUNTIME WRITER SEQUENCE ---
-    def run_sequence(q_str, a_str):
+    def run_sequence(q_str, a_str, is_followup=False):
         if close_timer_id[0]:
             root.after_cancel(close_timer_id[0])
             
@@ -155,18 +181,27 @@ def display_response(initial_query, initial_answer):
         query_label.configure(text="")
         response_label.configure(text="")
         
-        full_q = f"Hey Tony {q_str}"
+        # Dynamic Greeting Logic
+        if not is_followup:
+            a_str = f"Hey {USER_NAME}, {a_str}"
+            
         q_idx = [0]
         r_idx = [0]
 
         def type_query():
-            if q_idx[0] < len(full_q):
-                query_label.configure(text=full_q[:q_idx[0]+1] + "█")
+            if q_idx[0] < len(q_str):
+                query_label.configure(text=q_str[:q_idx[0]+1] + "█")
                 q_idx[0] += 1
                 root.after(20, type_query)
             else:
-                query_label.configure(text=full_q)
-                root.after(50, type_response)
+                query_label.configure(text=q_str)
+                response_label.configure(text="Thinking...█")
+                generate_audio(a_str, on_audio_ready)
+
+        def on_audio_ready(filepath):
+            response_label.configure(text="") 
+            play_and_cleanup(filepath, audio_finished_callback)
+            type_response()
 
         def type_response():
             if r_idx[0] < len(a_str):
@@ -174,30 +209,25 @@ def display_response(initial_query, initial_answer):
                 update_height(len(current_t))
                 response_label.configure(text=current_t + "█")
                 r_idx[0] += 1
-                delay = 120 if a_str[r_idx[0]-1] in ['.','!','?'] else 20
+                delay = 120 if a_str[r_idx[0]-1] in ['.','!','?'] else 40
                 root.after(delay, type_response)
             else:
                 response_label.configure(text=a_str)
-                # Once audio + typing is complete, flash the microphone into listening mode
-                def audio_finished_callback():
-                    root.after(0, activate_listening_ui)
-                
-                pre_generate_and_play_audio(a_str, callback=audio_finished_callback)
+
+        def audio_finished_callback():
+            root.after(0, activate_listening_ui)
 
         type_query()
 
     def activate_listening_ui():
         mic_btn.configure(text="● Listening", fg_color="#FF5F56", text_color="#FFFFFF")
-        reset_close_timer(10) # Gives 10 seconds to follow up before auto-closing
-        
-        # Open threaded follow-up mic interceptor automatically
+        reset_close_timer(10)
         threading.Thread(target=listen_for_followup, daemon=True).start()
 
     def listen_for_followup():
         with sr.Microphone() as source:
             recognizer.adjust_for_ambient_noise(source, duration=0.3)
             try:
-                # Listens for a brief reply window
                 audio_capture = recognizer.listen(source, timeout=5, phrase_time_limit=5)
                 followup_q = recognizer.recognize_google(audio_capture).strip()
                 
@@ -210,28 +240,23 @@ def display_response(initial_query, initial_answer):
                         contents=followup_q,
                         config=config
                     )
-                    # Loop back onto widget execution line smoothly
-                    root.after(0, lambda: run_sequence(followup_q, response.text))
+                    root.after(0, lambda: run_sequence(followup_q, response.text, is_followup=True))
             except Exception:
-                # If no audio or timeout occurs, let it naturally wind down to sleep state
                 pass
 
     def trigger_followup():
-        # Manual click fallback override
         reset_close_timer(10)
         activate_listening_ui()
 
-    # Initial boot block trigger
     root.attributes("-alpha", 1.0)
-    root.after(10, lambda: run_sequence(initial_query, initial_answer))
+    root.after(10, lambda: run_sequence(initial_query, initial_answer, is_followup=False))
     root.mainloop()
 
 # --- 4. MAIN WAKE LOOP ---
-print("Agent is active. Follow-up listening mechanics operational.")
+print(f"Agent initialized for {USER_NAME}. Draggable HUD and dynamic corners operational.")
 
 while True:
     try:
-        # Only run the wake word engine if the active HUD overlay is closed
         if not is_widget_open:
             if mic_stream.is_stopped():
                 mic_stream.start_stream()
