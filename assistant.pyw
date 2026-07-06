@@ -31,7 +31,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 MAX_EXCHANGES = 3  # Keeps the last 3 questions and 3 answers (6 messages total)
 conversation_history = []
 is_widget_open = False
-dictation_enabled = True  # Controls whether the assistant speaks aloud
+dictation_enabled = True  
 
 # --- AUDIO SETUP ---
 try:
@@ -63,10 +63,7 @@ def generate_audio(text, on_ready_callback):
 def play_and_cleanup(filepath, on_complete_callback):
     def task():
         pygame.mixer.music.load(filepath)
-        
-        # Set the volume right before playing based on current state
         pygame.mixer.music.set_volume(1.0 if dictation_enabled else 0.0)
-        
         pygame.mixer.music.play()
         while pygame.mixer.music.get_busy():
             time.sleep(0.05)
@@ -114,7 +111,7 @@ def get_gemini_response(user_text):
         raise e
 
 # --- 4. DRAGGABLE NATIVE HUD ---
-def display_response(initial_query, initial_answer):
+def display_response(initial_query=None, initial_answer=None):
     global is_widget_open, dictation_enabled
     is_widget_open = True
     
@@ -167,29 +164,37 @@ def display_response(initial_query, initial_answer):
         widget.bind("<ButtonPress-1>", start_move)
         widget.bind("<B1-Motion>", move_window)
 
-    # --- MAC WINDOW BUTTONS ---
     btn_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
     btn_frame.pack(side="left", padx=12)
     
     close_btn = ctk.CTkButton(
         btn_frame, text="", width=12, height=12, corner_radius=6, 
-        fg_color="#FF5F56", hover_color="#C93F3A", command=safe_close
+        fg_color="#FF5F56", hover_color="#C93F3A", command=safe_close,
+        font=("Arial", 11, "bold") 
     )
     close_btn.pack(side="left", padx=4)
+
+    def on_enter_close(e):
+        close_btn.configure(text="×", text_color="#330000") 
+        
+    def on_leave_close(e):
+        close_btn.configure(text="")
+
+    close_btn.bind("<Enter>", on_enter_close)
+    close_btn.bind("<Leave>", on_leave_close)
     
     for color in ["#FFBD2E", "#27C93F"]:
         ctk.CTkFrame(btn_frame, width=12, height=12, corner_radius=6, fg_color=color).pack(side="left", padx=4)
 
- # --- DICTATION TOGGLE BUTTON ---
     def toggle_dictation():
         global dictation_enabled
         dictation_enabled = not dictation_enabled
         if dictation_enabled:
             dictation_btn.configure(text="🔊", fg_color="#008000", hover_color="#006400")
-            pygame.mixer.music.set_volume(1.0) # Instantly restore volume
+            pygame.mixer.music.set_volume(1.0) 
         else:
             dictation_btn.configure(text="🔇", fg_color="#FF0000", hover_color="#CC0000")
-            pygame.mixer.music.set_volume(0.0) # Instantly mute volume
+            pygame.mixer.music.set_volume(0.0) 
 
     initial_color = "#008000" if dictation_enabled else "#FF0000"
     initial_icon = "🔊" if dictation_enabled else "🔇"
@@ -201,15 +206,13 @@ def display_response(initial_query, initial_answer):
     )
     dictation_btn.pack(side="left", padx=(10, 0))
 
-    # --- MIC BUTTON ---
     mic_btn = ctk.CTkButton(
         toolbar, text="● Mic Off", font=("Consolas", 11, "bold"), text_color="#AAAAAA",
-        fg_color="#3A3A3A", hover_color="#4A4A4A", corner_radius=5, width=75, height=24,
+        fg_color="#3A3A3A", hover_color="#4A4A4A", corner_radius=5, width=95, height=24,
         command=lambda: trigger_followup()
     )
     mic_btn.pack(side="right", padx=10)
 
-    # --- BODY & TEXT ---
     body = ctk.CTkFrame(panel, fg_color="transparent")
     body.pack(fill="both", expand=True, padx=15, pady=10)
     body.bind("<ButtonPress-1>", start_move)
@@ -240,12 +243,13 @@ def display_response(initial_query, initial_answer):
             root.after_cancel(close_timer_id[0])
         close_timer_id[0] = root.after(seconds * 1000, safe_close)
 
-    def run_sequence(q_str, a_str, is_followup=False):
+    def run_sequence(q_str, a_str, is_followup=False, skip_query_typing=False):
         if close_timer_id[0]:
             root.after_cancel(close_timer_id[0])
             
         mic_btn.configure(text="● Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
-        query_label.configure(text="")
+        if not skip_query_typing:
+            query_label.configure(text="")
         response_label.configure(text="")
         
         if not is_followup:
@@ -253,6 +257,7 @@ def display_response(initial_query, initial_answer):
             
         q_idx = [0]
         r_idx = [0]
+        
         def type_query():
             if q_idx[0] < len(q_str):
                 query_label.configure(text=q_str[:q_idx[0]+1] + "█")
@@ -260,9 +265,15 @@ def display_response(initial_query, initial_answer):
                 root.after(20, type_query)
             else:
                 query_label.configure(text=q_str)
-                # ALWAYS generate audio so it can be unmuted mid-sentence
+                start_response_phase()
+
+        def start_response_phase():
+            if dictation_enabled:
                 response_label.configure(text="Thinking...█")
                 generate_audio(a_str, on_audio_ready)
+            else:
+                response_label.configure(text="")
+                type_response()
 
         def on_audio_ready(filepath):
             response_label.configure(text="") 
@@ -279,39 +290,62 @@ def display_response(initial_query, initial_answer):
                 root.after(delay, type_response)
             else:
                 response_label.configure(text=a_str)
+                if not dictation_enabled:
+                    root.after(500, activate_listening_ui)
 
         def audio_finished_callback():
             root.after(0, activate_listening_ui)
 
-        type_query()
+        if skip_query_typing:
+            start_response_phase()
+        else:
+            type_query()
 
-    def activate_listening_ui():
+    def activate_listening_ui(is_first=False):
         mic_btn.configure(text="● Listening", fg_color="#FF5F56", text_color="#FFFFFF")
         reset_close_timer(10)
-        threading.Thread(target=listen_for_followup, daemon=True).start()
+        threading.Thread(target=lambda: listen_for_followup(is_first), daemon=True).start()
 
-    def listen_for_followup():
+    def listen_for_followup(is_first=False):
         with sr.Microphone() as source:
             recognizer.adjust_for_ambient_noise(source, duration=0.3)
             try:
                 audio_capture = recognizer.listen(source, timeout=5, phrase_time_limit=5)
+                
+                # Visual indicator that it's converting speech to text
+                root.after(0, lambda: mic_btn.configure(text="● Transcribing", fg_color="#FFBD2E", text_color="#000000"))
                 followup_q = recognizer.recognize_google(audio_capture).strip()
                 
                 if followup_q:
+                    # Instantly display transcribed text and switch to processing
+                    root.after(0, lambda: query_label.configure(text=followup_q))
+                    root.after(0, lambda: mic_btn.configure(text="● Processing", fg_color="#3A3A3A", text_color="#AAAAAA"))
                     try:
                         answer = get_gemini_response(followup_q)
-                        root.after(0, lambda: run_sequence(followup_q, answer, is_followup=True))
+                        # Skip the typing animation for the query since we already displayed it
+                        root.after(0, lambda: run_sequence(followup_q, answer, is_followup=not is_first, skip_query_typing=True))
                     except Exception as e:
                         print(f"Follow-up Error: {e}")
+                        root.after(0, lambda: response_label.configure(text="API Error occurred."))
+                        root.after(3000, safe_close)
+            
+            except sr.WaitTimeoutError:
+                root.after(0, safe_close)
             except Exception:
-                pass
+                root.after(0, safe_close)
 
     def trigger_followup():
         reset_close_timer(10)
-        activate_listening_ui()
+        activate_listening_ui(is_first=False)
 
     root.attributes("-alpha", 1.0)
-    root.after(10, lambda: run_sequence(initial_query, initial_answer, is_followup=False))
+    
+    if initial_query and initial_answer:
+        root.after(10, lambda: run_sequence(initial_query, initial_answer, is_followup=False))
+    else:
+        # Launch immediately into listening mode
+        root.after(10, lambda: activate_listening_ui(is_first=True))
+        
     root.mainloop()
 
 # --- 5. MAIN WAKE LOOP ---
@@ -330,22 +364,11 @@ while True:
             if model.prediction_buffer[WAKE_WORD][-1] > 0.5:
                 print(f"\n[Trigger] Detected wake phrase: '{WAKE_WORD}'")
                 mic_stream.stop_stream()
-                
-                with sr.Microphone() as source:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.4)
-                    try:
-                        audio_capture = recognizer.listen(source, timeout=4, phrase_time_limit=6)
-                        user_question = recognizer.recognize_google(audio_capture).strip()
-                        
-                        try:
-                            answer = get_gemini_response(user_question)
-                            display_response(user_question, answer)
-                        except Exception as e:
-                            print(f"API Error: {e}")
-                            
-                    except Exception as e:
-                        print(f"Speech Error: {e}")
                 model.reset()
+                
+                # Instantly display the widget empty and let it handle the listening
+                display_response()
+                
                 time.sleep(1)
         else:
             time.sleep(0.5)
