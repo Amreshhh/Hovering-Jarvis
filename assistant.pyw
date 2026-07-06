@@ -63,6 +63,10 @@ def generate_audio(text, on_ready_callback):
 def play_and_cleanup(filepath, on_complete_callback):
     def task():
         pygame.mixer.music.load(filepath)
+        
+        # Set the volume right before playing based on current state
+        pygame.mixer.music.set_volume(1.0 if dictation_enabled else 0.0)
+        
         pygame.mixer.music.play()
         while pygame.mixer.music.get_busy():
             time.sleep(0.05)
@@ -176,14 +180,16 @@ def display_response(initial_query, initial_answer):
     for color in ["#FFBD2E", "#27C93F"]:
         ctk.CTkFrame(btn_frame, width=12, height=12, corner_radius=6, fg_color=color).pack(side="left", padx=4)
 
-    # --- DICTATION TOGGLE BUTTON ---
+ # --- DICTATION TOGGLE BUTTON ---
     def toggle_dictation():
         global dictation_enabled
         dictation_enabled = not dictation_enabled
         if dictation_enabled:
             dictation_btn.configure(text="🔊", fg_color="#008000", hover_color="#006400")
+            pygame.mixer.music.set_volume(1.0) # Instantly restore volume
         else:
             dictation_btn.configure(text="🔇", fg_color="#FF0000", hover_color="#CC0000")
+            pygame.mixer.music.set_volume(0.0) # Instantly mute volume
 
     initial_color = "#008000" if dictation_enabled else "#FF0000"
     initial_icon = "🔊" if dictation_enabled else "🔇"
@@ -247,7 +253,6 @@ def display_response(initial_query, initial_answer):
             
         q_idx = [0]
         r_idx = [0]
-
         def type_query():
             if q_idx[0] < len(q_str):
                 query_label.configure(text=q_str[:q_idx[0]+1] + "█")
@@ -255,12 +260,9 @@ def display_response(initial_query, initial_answer):
                 root.after(20, type_query)
             else:
                 query_label.configure(text=q_str)
-                if dictation_enabled:
-                    response_label.configure(text="Thinking...█")
-                    generate_audio(a_str, on_audio_ready)
-                else:
-                    response_label.configure(text="")
-                    type_response()
+                # ALWAYS generate audio so it can be unmuted mid-sentence
+                response_label.configure(text="Thinking...█")
+                generate_audio(a_str, on_audio_ready)
 
         def on_audio_ready(filepath):
             response_label.configure(text="") 
@@ -277,8 +279,6 @@ def display_response(initial_query, initial_answer):
                 root.after(delay, type_response)
             else:
                 response_label.configure(text=a_str)
-                if not dictation_enabled:
-                    root.after(500, activate_listening_ui)
 
         def audio_finished_callback():
             root.after(0, activate_listening_ui)
