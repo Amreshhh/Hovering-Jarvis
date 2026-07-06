@@ -116,6 +116,9 @@ class AssistantHUD:
         r_idx = [0]
         response_render_complete = [False]
         audio_playback_complete = [not self.service.dictation_enabled]
+        audio_ready = [False]
+        audio_started = [False]
+        pending_audio_file = [None]
         response_step = 3
 
         def activate_listening_ui(is_first=False):
@@ -128,6 +131,16 @@ class AssistantHUD:
         def finalize_response_stage():
             if response_render_complete[0] and audio_playback_complete[0]:
                 activate_listening_ui()
+
+        def start_audio_playback_if_ready():
+            if self.service.barge_in_triggered or audio_started[0] or not audio_ready[0]:
+                return
+            if not pending_audio_file[0]:
+                audio_playback_complete[0] = True
+                finalize_response_stage()
+                return
+            audio_started[0] = True
+            self.service.play_and_cleanup(pending_audio_file[0], audio_finished_callback)
 
         def type_query():
             if self.service.barge_in_triggered:
@@ -146,18 +159,15 @@ class AssistantHUD:
             if self.service.dictation_enabled:
                 response_label.configure(text="Thinking...█")
                 self.service.generate_audio(a_str, on_audio_ready)
-                type_response()
-            else:
-                response_label.configure(text="")
-                type_response()
+            type_response()
 
         def on_audio_ready(filepath):
             if self.service.barge_in_triggered:
                 return
-            if filepath:
-                self.service.play_and_cleanup(filepath, audio_finished_callback)
-            else:
-                audio_finished_callback()
+            pending_audio_file[0] = filepath
+            audio_ready[0] = True
+            if response_render_complete[0]:
+                start_audio_playback_if_ready()
 
         def type_response():
             if self.service.barge_in_triggered:
@@ -175,7 +185,10 @@ class AssistantHUD:
                 response_label.configure(text=a_str)
                 response_render_complete[0] = True
                 if not self.service.barge_in_triggered:
-                    finalize_response_stage()
+                    if not self.service.dictation_enabled:
+                        self.root.after(500, finalize_response_stage)
+                    else:
+                        start_audio_playback_if_ready()
 
         def audio_finished_callback():
             if not self.service.barge_in_triggered:
@@ -386,5 +399,4 @@ class AssistantHUD:
 
         self.root.attributes("-alpha", 1.0)
         self.root.after(100, self._process_queue_events)
-        self.root.after(10, self._activate_listening_ui)
         self.root.mainloop()

@@ -9,5 +9,6 @@ pyaudio>=0.2.14
 pygame>=2.6.0
 pyttsx3>=2.98
 python-dotenv>=1.0.1
+setuptools<81
 SpeechRecognition>=3.10.4
 vosk>=0.3.45

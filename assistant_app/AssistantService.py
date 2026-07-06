@@ -11,6 +11,8 @@ import threading
 import time
 import uuid
 import zipfile
+import logging
+import warnings
 
 import concurrent.futures
 
@@ -20,9 +22,18 @@ from nltk.corpus import wordnet
 from groq import Groq
 from google import genai
 from google.genai import types
+import pyaudio
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+    module=r"pygame\.pkgdata",
+)
+
+logging.getLogger().setLevel(logging.ERROR)
+
 import openwakeword
 from openwakeword.model import Model
-import pyaudio
 import pygame
 import pyttsx3
 import speech_recognition as sr
@@ -38,8 +49,6 @@ class AssistantService:
 
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
         os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "hide"
-        import logging
-
         logging.getLogger("openwakeword").setLevel(logging.ERROR)
 
         self.state_lock = threading.Lock()
@@ -92,9 +101,8 @@ class AssistantService:
 
     def _load_wake_model(self):
         try:
-            openwakeword.utils.download_models()
             return Model(wakeword_models=[self.config.wake_word])
-        except ValueError:
+        except Exception:
             self.active_wake_word = "alexa"
             self.log("Wake word model not available. Falling back to 'alexa'.", "WARNING")
             return Model(wakeword_models=[self.active_wake_word])
@@ -109,7 +117,11 @@ class AssistantService:
 
     def run_with_timeout(self, func, timeout_sec, *args, **kwargs):
         future = self.global_executor.submit(func, *args, **kwargs)
-        return future.result(timeout=timeout_sec)
+        try:
+            return future.result(timeout=timeout_sec)
+        except Exception:
+            future.cancel()
+            raise
 
     @staticmethod
     def _sanitize_word(text):
