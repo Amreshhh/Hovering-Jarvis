@@ -17,11 +17,18 @@ class AssistantHUD:
         self.position = None
         self.close_timer_id = [None]
         self.widgets = {}
+        self.active_token = 0
+        self.listening_active = False
 
     def _build_window(self):
         self.root = ctk.CTk()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
+        # Slight overall window transparency to simulate acrylic
+        try:
+            self.root.attributes("-alpha", 0.95)
+        except Exception:
+            pass
         self.root.wm_attributes("-transparentcolor", self.transparent_color)
         self.root.configure(fg_color=self.transparent_color)
 
@@ -39,6 +46,7 @@ class AssistantHUD:
     def _safe_close(self):
         with self.service.state_lock:
             self.service.is_widget_open = False
+            self.listening_active = False
         log_msg("Closing Widget.", "INFO")
         if self.root:
             for after_id in self.root.tk.eval("after info").split():
@@ -100,11 +108,23 @@ class AssistantHUD:
             except Exception:
                 pass
 
-        mic_btn = self.widgets["mic_btn"]
+        # Bump the generation token so any stale callback from a previous,
+        # interrupted sequence (e.g. a delayed audio-playback thread) can
+        # recognize it no longer belongs to the active sequence and no-op
+        # instead of firing a duplicate "listening" activation.
+        self.active_token += 1
+        token = self.active_token
+        self.listening_active = False
+
+        def is_stale():
+            return token != self.active_token or self.service.barge_in_triggered
+
+        status_pill = self.widgets["status_pill"]
         query_label = self.widgets["query_label"]
         response_label = self.widgets["response_label"]
 
-        self._safe_gui(mic_btn.configure, text="● Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
+        # UPDATED: Use the new status pill and image dot notation
+        self._safe_gui(status_pill.configure, text="• Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
         if not skip_query_typing:
             self._safe_gui(query_label.configure, text="")
         self._safe_gui(response_label.configure, text="")
@@ -122,18 +142,19 @@ class AssistantHUD:
         response_step = 3
 
         def activate_listening_ui(is_first=False):
-            if self.service.barge_in_triggered:
+            if is_stale():
                 return
-            mic_btn.configure(text="● Listening", fg_color="#FF5F56", text_color="#FFFFFF")
+            # UPDATED: Style change for the status pill
+            status_pill.configure(text="• Listening", fg_color="#FF5F56", text_color="#FFFFFF")
             self._reset_close_timer(10)
-            threading.Thread(target=lambda: self._listen_for_followup(is_first), daemon=True).start()
+            self._start_listening_thread(is_first)
 
         def finalize_response_stage():
             if response_render_complete[0] and audio_playback_complete[0]:
                 activate_listening_ui()
 
         def start_audio_playback_if_ready():
-            if self.service.barge_in_triggered or audio_started[0] or not audio_ready[0]:
+            if is_stale() or audio_started[0] or not audio_ready[0]:
                 return
             if not pending_audio_file[0]:
                 audio_playback_complete[0] = True
@@ -143,7 +164,7 @@ class AssistantHUD:
             self.service.play_and_cleanup(pending_audio_file[0], audio_finished_callback)
 
         def type_query():
-            if self.service.barge_in_triggered:
+            if is_stale():
                 return
             if q_idx[0] < len(q_str):
                 query_label.configure(text=q_str[: q_idx[0] + 1] + "█")
@@ -154,7 +175,7 @@ class AssistantHUD:
                 start_response_phase()
 
         def start_response_phase():
-            if self.service.barge_in_triggered:
+            if is_stale():
                 return
             if self.service.dictation_enabled:
                 response_label.configure(text="Thinking...█")
@@ -162,15 +183,17 @@ class AssistantHUD:
             type_response()
 
         def on_audio_ready(filepath):
-            if self.service.barge_in_triggered:
+            if is_stale():
                 return
             pending_audio_file[0] = filepath
             audio_ready[0] = True
-            if response_render_complete[0]:
-                start_audio_playback_if_ready()
+            # Start playback as soon as the audio is ready so voice dictation
+            # and the text typewriter run simultaneously instead of the
+            # audio waiting for the typing animation to finish first.
+            start_audio_playback_if_ready()
 
         def type_response():
-            if self.service.barge_in_triggered:
+            if is_stale():
                 return
             if r_idx[0] < len(a_str):
                 next_index = min(r_idx[0] + response_step, len(a_str))
@@ -184,14 +207,14 @@ class AssistantHUD:
             else:
                 response_label.configure(text=a_str)
                 response_render_complete[0] = True
-                if not self.service.barge_in_triggered:
+                if not is_stale():
                     if not self.service.dictation_enabled:
                         self.root.after(500, finalize_response_stage)
                     else:
                         start_audio_playback_if_ready()
 
         def audio_finished_callback():
-            if not self.service.barge_in_triggered:
+            if not is_stale():
                 audio_playback_complete[0] = True
                 self._safe_gui(finalize_response_stage)
 
@@ -201,16 +224,17 @@ class AssistantHUD:
             type_query()
 
     def _listen_for_followup(self, is_first=False):
-        mic_btn = self.widgets["mic_btn"]
+        status_pill = self.widgets["status_pill"]
         query_label = self.widgets["query_label"]
         try:
-            self._safe_gui(mic_btn.configure, text="● Transcribing", fg_color="#FFBD2E", text_color="#000000")
+            # UPDATED: Style change for the status pill
+            self._safe_gui(status_pill.configure, text="• Transcribing", fg_color="#FFBD2E", text_color="#000000")
             followup_q = self._transcribe_followup()
             log_msg(f"Heard: '{followup_q}'", "INFO")
 
             if followup_q and not self.service.barge_in_triggered:
                 self._safe_gui(query_label.configure, text="")
-                self._safe_gui(mic_btn.configure, text="● Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
+                self._safe_gui(status_pill.configure, text="• Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
                 try:
                     answer = self.service.process_query_master(followup_q)
                     if not self.service.barge_in_triggered:
@@ -230,18 +254,24 @@ class AssistantHUD:
             self._safe_gui(self._safe_close)
 
     def _trigger_followup_or_interrupt(self):
-        mic_btn = self.widgets["mic_btn"]
+        status_pill = self.widgets["status_pill"]
         response_label = self.widgets["response_label"]
         query_label = self.widgets["query_label"]
-        current_state = mic_btn.cget("text")
+        current_state = status_pill.cget("text")
 
-        if current_state in ["● Processing", "● Transcribing"] or pygame.mixer.music.get_busy():
+        # UPDATED: Check for 'Listening' or other active states in the pill text
+        if current_state in ["• Processing", "• Transcribing"] or pygame.mixer.music.get_busy():
             log_msg("Barge-in triggered by user button tap! Interrupting...", "WARNING")
             with self.service.state_lock:
                 self.service.barge_in_triggered = True
+            # Invalidate the running sequence immediately so any of its
+            # in-flight callbacks (e.g. a lagging audio-finished callback)
+            # recognize themselves as stale the instant we barge in, rather
+            # than only after barge_in_triggered gets reset 100ms later.
+            self.active_token += 1
             if pygame.mixer.music.get_busy():
                 pygame.mixer.music.stop()
-            mic_btn.configure(text="● Listening", fg_color="#FF5F56", text_color="#FFFFFF")
+            status_pill.configure(text="• Listening", fg_color="#FF5F56", text_color="#FFFFFF")
             response_label.configure(text="")
             query_label.configure(text="")
             self.root.after(100, self._reset_barge_flag_and_listen)
@@ -253,15 +283,25 @@ class AssistantHUD:
         with self.service.state_lock:
             self.service.barge_in_triggered = False
         self._reset_close_timer(10)
-        threading.Thread(target=lambda: self._listen_for_followup(False), daemon=True).start()
+        self.listening_active = False
+        self._start_listening_thread(False)
+
+    def _start_listening_thread(self, is_first=False):
+        # Central gate so at most one follow-up capture thread is ever
+        # active — button mashing or an interrupt racing with the normal
+        # post-response activation can no longer spawn duplicate listeners.
+        if self.listening_active:
+            return
+        self.listening_active = True
+        threading.Thread(target=lambda: self._listen_for_followup(is_first), daemon=True).start()
 
     def _activate_listening_ui(self, is_first=False):
         if self.service.barge_in_triggered:
             return
-        mic_btn = self.widgets["mic_btn"]
-        mic_btn.configure(text="● Listening", fg_color="#FF5F56", text_color="#FFFFFF")
+        status_pill = self.widgets["status_pill"]
+        status_pill.configure(text="• Listening", fg_color="#FF5F56", text_color="#FFFFFF")
         self._reset_close_timer(10)
-        threading.Thread(target=lambda: self._listen_for_followup(is_first), daemon=True).start()
+        self._start_listening_thread(is_first)
 
     def capture_initial_query(self):
         try:
@@ -286,27 +326,33 @@ class AssistantHUD:
 
         self._build_window()
 
+        # UPDATED: Create a single, translucent background panel for the entire UI
+        # fg_color includes a hex value with alpha (e.g., #555555CC) for transparency.
+        # Use a lighter grey panel; overall window alpha provides translucency
         panel = ctk.CTkFrame(
             self.root,
             corner_radius=12,
-            fg_color="#1E1E1E",
+            fg_color="#6B6F73",
             bg_color=self.transparent_color,
             border_width=1,
             border_color="#333333",
         )
         panel.pack(fill="both", expand=True, padx=12, pady=12)
 
-        toolbar = ctk.CTkFrame(panel, corner_radius=12, fg_color="#2D2D2D", bg_color="#1E1E1E", height=35)
-        toolbar.pack(fill="x", padx=0, pady=0)
-        toolbar.pack_propagate(False)
+        # Dragging bindings for the panel
+        panel.bind("<ButtonPress-1>", self._start_move)
+        panel.bind("<B1-Motion>", self._move_window)
 
-        for widget in (toolbar, panel):
-            widget.bind("<ButtonPress-1>", self._start_move)
-            widget.bind("<B1-Motion>", self._move_window)
+        # UPDATED: Header container, no separate toolbar frame, just place controls on top of the translucent panel
+        # Keep header same tint as panel to create a seamless frosted look
+        header = ctk.CTkFrame(panel, fg_color="#6B6F73")
+        header.pack(fill="x", side="top", padx=12, pady=(10, 5))
 
-        btn_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
-        btn_frame.pack(side="left", padx=12)
+        # Mac Dots Frame
+        btn_frame = ctk.CTkFrame(header, fg_color="transparent")
+        btn_frame.pack(side="left", padx=(2, 10))
 
+        # UPDATED: Stylized dots. Red dot with '×' on hover
         close_btn = ctk.CTkButton(
             btn_frame,
             text="",
@@ -322,69 +368,84 @@ class AssistantHUD:
         close_btn.bind("<Enter>", lambda e: close_btn.configure(text="×", text_color="#330000"))
         close_btn.bind("<Leave>", lambda e: close_btn.configure(text=""))
 
+        # Yellow and Green dots as frames
         for color in ["#FFBD2E", "#27C93F"]:
             ctk.CTkFrame(btn_frame, width=12, height=12, corner_radius=6, fg_color=color).pack(side="left", padx=4)
 
+        # Flat, subtle Opacity Slider
         opacity_slider = ctk.CTkSlider(
-            toolbar,
+            header,
             from_=0.2,
             to=1.0,
             width=60,
             height=10,
             command=self._change_opacity,
             border_width=0,
-            button_color="#555555",
-            button_hover_color="#777777",
-            progress_color="#888888",
+            button_color="#CCCCCC",
+            button_hover_color="#FFFFFF",
+            progress_color="#ffbd44",
+            fg_color="#333333"
         )
         opacity_slider.set(1.0)
         opacity_slider.pack(side="left", padx=(15, 5))
 
+        # UPDATED: The new pill-shaped green speaker button on the far right
+        # Style mapped to image: green pill, white speaker icon.
         def toggle_dictation():
             self.service.dictation_enabled = not self.service.dictation_enabled
             if self.service.dictation_enabled:
-                dictation_btn.configure(text="🔊", fg_color="#008000", hover_color="#006400")
+                speaker_pill.configure(fg_color="#27C93F", hover_color="#20A032")
                 pygame.mixer.music.set_volume(1.0)
             else:
-                dictation_btn.configure(text="🔇", fg_color="#FF0000", hover_color="#CC0000")
+                # Still use green for appearance, just toggle audio logic
+                speaker_pill.configure(fg_color="#ff605c", hover_color="#d04040")
                 pygame.mixer.music.set_volume(0.0)
 
-        dictation_btn = ctk.CTkButton(
-            toolbar,
-            text="🔊" if self.service.dictation_enabled else "🔇",
-            width=26,
-            height=26,
-            corner_radius=13,
-            font=("Segoe UI Emoji", 14),
+        # Speaker emoji "🔊" as icon, green pill style
+        speaker_pill = ctk.CTkButton(
+            header,
+            text="🔊",
+            font=("Consolas", 14),
             text_color="#FFFFFF",
-            fg_color="#008000" if self.service.dictation_enabled else "#FF0000",
-            hover_color="#333333",
+            fg_color="#27C93F" if self.service.dictation_enabled else "#ff605c",
+            hover_color="#20A032",
+            corner_radius=13, # Pill shape for height 26
+            width=30,
+            height=26,
             command=toggle_dictation,
         )
-        dictation_btn.pack(side="right", padx=(5, 5))
+        speaker_pill.pack(side="right", padx=(5, 5))
 
-        mic_btn = ctk.CTkButton(
-            toolbar,
-            text="● Mic Off",
+        # UPDATED: Pill-shaped status button (replacing mic_btn) with text "• Mic Off"
+        # Style mapped to image: dark, pill shape. targeted by statuses like Processing.
+        # uses the specific dot '•' notation.
+        status_pill = ctk.CTkButton(
+            header,
+            text="• Mic Off",
             font=("Consolas", 11, "bold"),
             text_color="#AAAAAA",
-            fg_color="#3A3A3A",
-            hover_color="#4A4A4A",
-            corner_radius=5,
+            fg_color="#333333", # Dark background like image
+            hover_color="#444444",
+            corner_radius=6,
             width=95,
-            height=24,
+            height=26,
             command=self._trigger_followup_or_interrupt,
         )
-        mic_btn.pack(side="right", padx=(5, 10))
+        status_pill.pack(side="right", padx=(5, 10))
 
+        # Body area for text content
         body = ctk.CTkFrame(panel, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=15, pady=10)
+        body.pack(fill="both", expand=True, padx=15, pady=(5, 10))
+
+        # Preserve dragging logic on body
         body.bind("<ButtonPress-1>", self._start_move)
         body.bind("<B1-Motion>", self._move_window)
 
+        # Prompt frame (user text line)
         prompt_frame = ctk.CTkFrame(body, fg_color="transparent")
         prompt_frame.pack(fill="x", anchor="w")
 
+        # Console-style user line formatting
         ctk.CTkLabel(prompt_frame, text=f"{self.config.user_name}:", font=("Consolas", 13, "bold"), text_color="#00FF9C").pack(side="left")
         ctk.CTkLabel(prompt_frame, text="~", font=("Consolas", 13, "bold"), text_color="#0066FF").pack(side="left", padx=(6, 0))
         ctk.CTkLabel(prompt_frame, text="$", font=("Consolas", 13, "bold"), text_color="#FF00FF").pack(side="left", padx=(6, 10))
@@ -392,11 +453,18 @@ class AssistantHUD:
         query_label = ctk.CTkLabel(prompt_frame, text="", font=("Consolas", 13), text_color="#FFFFFF")
         query_label.pack(side="left")
 
+        # Response label (typing area)
         response_label = ctk.CTkLabel(body, text="", font=("Consolas", 13), text_color="#CCCCCC", justify="left", wraplength=370)
         response_label.pack(anchor="w", pady=(10, 0))
 
-        self.widgets = {"mic_btn": mic_btn, "query_label": query_label, "response_label": response_label}
+        # Register widgets with updated names
+        self.widgets = {"status_pill": status_pill, "query_label": query_label, "response_label": response_label}
 
-        self.root.attributes("-alpha", 1.0)
+        # Initialize window state and processing
+        # keep the overall slight transparency for the frosted effect
+        try:
+            self.root.attributes("-alpha", 0.95)
+        except Exception:
+            pass
         self.root.after(100, self._process_queue_events)
         self.root.mainloop()

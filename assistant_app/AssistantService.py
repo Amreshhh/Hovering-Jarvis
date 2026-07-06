@@ -59,7 +59,8 @@ class AssistantService:
         self.widget_command_queue = queue.Queue()
         self.conversation_history = deque(maxlen=self.config.max_exchanges * 2)
         self.key_fail_counts: dict[str, int] = {}
-        self.global_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        self.global_executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+        self.playback_epoch = 0
 
         self.recognizer = sr.Recognizer()
         self.offline_tts = pyttsx3.init()
@@ -155,7 +156,7 @@ class AssistantService:
 
     def get_groq_response(self, client, user_text, timeout_val):
         messages = [
-            {"role": "system", "content": "You are a fast, minimalist assistant. Answer in 1 or 2 sentences."}
+            {"role": "system", "content": "You are a fast, minimalist assistant. Explain using layman's terms and avoid bombastic definitions. When defining words, include one example sentence. Answer in 1 or 2 sentences."}
         ] + self._history_messages_for_groq() + [{"role": "user", "content": user_text}]
         response = client.chat.completions.create(messages=messages, model=self.config.groq_model, timeout=timeout_val)
         answer = (response.choices[0].message.content or "").strip()
@@ -164,11 +165,12 @@ class AssistantService:
         self._remember_exchange(user_text, answer)
         return answer
 
-    def get_gemini_response(self, client, user_text):
+    def get_gemini_response(self, client, user_text, timeout_val):
         history = self._history_messages_for_gemini()
         history.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
         config = types.GenerateContentConfig(
-            system_instruction="You are a fast, minimalist assistant. Answer in 1 or 2 sentences."
+            system_instruction="You are a fast, minimalist assistant. Explain using layman's terms and avoid bombastic definitions. When defining words, include one example sentence. Answer in 1 or 2 sentences.",
+            http_options=types.HttpOptions(timeout=int(timeout_val * 1000)),
         )
         response = client.models.generate_content(model=self.config.gemini_model, contents=history, config=config)
         answer = (response.text or "").strip()
@@ -221,9 +223,16 @@ class AssistantService:
             for node in active_geminis:
                 if self.barge_in_triggered:
                     return None
+                timeout_val = 4.0
                 try:
-                    self.log(f"Attempting {node['id']} (4.0s limit)...", "INFO")
-                    answer = self.run_with_timeout(self.get_gemini_response, 4.0, node["client"], user_text)
+                    self.log(f"Attempting {node['id']} ({timeout_val}s limit)...", "INFO")
+                    answer = self.run_with_timeout(
+                        self.get_gemini_response,
+                        timeout_val,
+                        node["client"],
+                        user_text,
+                        timeout_val,
+                    )
                     self.key_fail_counts[node["id"]] = 0
                     return answer
                 except Exception as exc:
@@ -279,17 +288,31 @@ class AssistantService:
         threading.Thread(target=target, daemon=True).start()
 
     def play_and_cleanup(self, filepath, on_complete_callback):
+        with self.state_lock:
+            self.playback_epoch += 1
+            my_epoch = self.playback_epoch
+
+        def is_stale():
+            return my_epoch != self.playback_epoch
+
         def task():
             try:
+                # Defensively stop any prior track first so a lagging old
+                # thread can never keep monitoring/steering this new one.
+                if pygame.mixer.music.get_busy():
+                    pygame.mixer.music.stop()
+                if is_stale():
+                    return
                 pygame.mixer.music.load(filepath)
                 pygame.mixer.music.set_volume(1.0 if self.dictation_enabled else 0.0)
                 pygame.mixer.music.play()
                 while pygame.mixer.music.get_busy():
-                    if self.barge_in_triggered:
+                    if self.barge_in_triggered or is_stale():
                         pygame.mixer.music.stop()
                         break
                     time.sleep(0.05)
-                pygame.mixer.music.unload()
+                if not is_stale():
+                    pygame.mixer.music.unload()
             except Exception as exc:
                 self.log(f"Audio playback failed: {exc}", "WARNING")
             finally:
@@ -298,7 +321,7 @@ class AssistantService:
                         os.remove(filepath)
                 except OSError:
                     pass
-                if on_complete_callback and not self.barge_in_triggered:
+                if on_complete_callback and not self.barge_in_triggered and not is_stale():
                     on_complete_callback()
 
         threading.Thread(target=task, daemon=True).start()
