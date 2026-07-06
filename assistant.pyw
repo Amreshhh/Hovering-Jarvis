@@ -52,57 +52,60 @@ from nltk.corpus import wordnet
 from groq import Groq  
 from google import genai
 from google.genai import types
+from duckduckgo_search import DDGS 
 
-# --- 1. SECURE CONFIGURATION & PRE-FLIGHT CHECK ---
+# --- 1. SECURE CONFIGURATION & CLIENT POOLS ---
 load_dotenv()
 USER_NAME = os.getenv("USER_NAME", "User") 
 WAKE_WORD = os.getenv("WAKE_WORD", "alexa").lower() 
-VOSK_MODEL_PATH = "vosk-model-small-en-us" # Ensure this folder exists!
 
-# Dynamically gather all keys from .env
 raw_groq_keys = [os.getenv(f"GROQ_API_KEY_{i}") for i in range(1, 4) if os.getenv(f"GROQ_API_KEY_{i}")]
 raw_gemini_keys = [os.getenv(f"GEMINI_API_KEY_{i}") for i in range(1, 3) if os.getenv(f"GEMINI_API_KEY_{i}")]
 
-# Strict Pre-Flight Validation
-if not raw_groq_keys:
-    log_msg("CRITICAL ERROR: Minimum one GROQ_API_KEY_x is required in the .env file.", "ERROR")
-    exit(1)
-if not raw_gemini_keys:
-    log_msg("CRITICAL ERROR: Minimum one GEMINI_API_KEY_x is required in the .env file.", "ERROR")
+if not raw_groq_keys or not raw_gemini_keys:
+    log_msg("CRITICAL ERROR: Keys missing in .env layer.", "ERROR")
     exit(1)
 
-# Initialize Client Pools for Load Balancing
-groq_clients = [Groq(api_key=key) for key in raw_groq_keys]
-gemini_clients = [genai.Client(api_key=key) for key in raw_gemini_keys]
-log_msg(f"API Pools Loaded: {len(groq_clients)} Groq nodes, {len(gemini_clients)} Gemini nodes.", "SUCCESS")
+key_fail_counts = {}
+groq_clients = []
+for i, key in enumerate(raw_groq_keys):
+    key_id = f"Groq_Node_{i+1}"
+    key_fail_counts[key_id] = 0
+    groq_clients.append({"id": key_id, "client": Groq(api_key=key)})
 
+gemini_clients = []
+for i, key in enumerate(raw_gemini_keys):
+    key_id = f"Gemini_Node_{i+1}"
+    key_fail_counts[key_id] = 0
+    gemini_clients.append({"id": key_id, "client": genai.Client(api_key=key)})
 
-# --- CONVERSATION HISTORY & STATE ---
-MAX_EXCHANGES = 3  
-conversation_history = []
+global_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+state_lock = threading.Lock()
 is_widget_open = False
 dictation_enabled = True  
+barge_in_triggered = False  
+conversation_history = []
+MAX_EXCHANGES = 3  
 
-# --- NETWORK CHECKER ---
+# Communication queue between wake loop and UI
+widget_command_queue = []
+
+# --- AUDIO, NETWORK & LOCAL DB STACK ---
 def check_internet(timeout=1):
     try:
         socket.setdefaulttimeout(timeout)
         socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
         return True
-    except OSError:
-        return False
+    except OSError: return False
 
-# --- OFFLINE DICTIONARY SETUP ---
-log_msg("Initializing offline dictionary...", "INFO")
+log_msg("Initializing local engine components...", "INFO")
 try:
     nltk.data.find('corpora/wordnet.zip')
     _ = wordnet.synsets("hello")
 except (LookupError, zipfile.BadZipFile):
-    log_msg("WordNet missing. Downloading fresh copy...", "WARNING")
     nltk.download('wordnet', quiet=True, force=True)
-    _ = wordnet.synsets("hello")
 
-# --- AUDIO & TTS SETUP ---
 try:
     openwakeword.utils.download_models()
     model = Model(wakeword_models=[WAKE_WORD])
@@ -116,53 +119,49 @@ offline_tts = pyttsx3.init()
 offline_tts.setProperty('rate', 170) 
 
 audio = pyaudio.PyAudio()
-mic_stream = audio.open(format=pyaudio.paInt16, channels=1, rate=16000, 
-                        input=True, frames_per_buffer=1280)
+mic_stream = audio.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1280)
 
-# --- 2. DUAL SYNCHRONIZED AUDIO ENGINE ---
+# --- 2. AUDIO GENERATION & RUNTIME EXECUTORS ---
 def generate_audio(text, on_ready_callback):
     is_online = check_internet()
-    
     def online_task():
         output_file = "temp_response.mp3"
         communicate = edge_tts.Communicate(text, "en-US-GuyNeural")
         asyncio.run(communicate.save(output_file))
         on_ready_callback(output_file)
-        
     def offline_task():
         output_file = "temp_response.wav"
         offline_tts.save_to_file(text, output_file)
         offline_tts.runAndWait()
         on_ready_callback(output_file)
-
     target = online_task if is_online else offline_task
     threading.Thread(target=target, daemon=True).start()
 
 def play_and_cleanup(filepath, on_complete_callback):
     def task():
+        global barge_in_triggered
         pygame.mixer.music.load(filepath)
         pygame.mixer.music.set_volume(1.0 if dictation_enabled else 0.0)
         pygame.mixer.music.play()
         while pygame.mixer.music.get_busy():
+            if barge_in_triggered:
+                pygame.mixer.music.stop()
+                break
             time.sleep(0.05)
         pygame.mixer.music.unload()
         try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
+            if os.path.exists(filepath): os.remove(filepath)
         except OSError: pass
-        if on_complete_callback:
+        
+        if on_complete_callback and not barge_in_triggered:
             on_complete_callback()
+            
     threading.Thread(target=task, daemon=True).start()
 
-# --- 3. THE MASTER ROUTING ENGINE (WITH LOAD BALANCING) ---
+# --- 3. MASTER ROUTING CORE ---
 def run_with_timeout(func, timeout_sec, *args, **kwargs):
-    """Forces slow APIs to fail fast by wrapping them in a strict timeout thread."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(func, *args, **kwargs)
-        try:
-            return future.result(timeout=timeout_sec)
-        except concurrent.futures.TimeoutError:
-            raise TimeoutError(f"API timed out after {timeout_sec}s.")
+    future = global_executor.submit(func, *args, **kwargs)
+    return future.result(timeout=timeout_sec)
 
 def get_offline_definition(user_text):
     match = re.search(r'^(define|meaning of|what is the meaning of)\s+(.+)', user_text.lower().strip())
@@ -175,7 +174,7 @@ def get_offline_definition(user_text):
 def get_groq_response(client, user_text, timeout_val):
     global conversation_history
     history_copy = conversation_history[- (MAX_EXCHANGES * 2):]
-    messages = [{"role": "system", "content": "You are a fast, minimalist assistant. Answer in 1 or 2 short sentences."}] + history_copy + [{"role": "user", "content": user_text}]
+    messages = [{"role": "system", "content": "You are a fast, minimalist assistant. Answer in 1 or 2 sentences."}] + history_copy + [{"role": "user", "content": user_text}]
     response = client.chat.completions.create(messages=messages, model="llama-3.1-8b-instant", timeout=timeout_val)
     ans = response.choices[0].message.content
     conversation_history.extend([{"role": "user", "content": user_text}, {"role": "assistant", "content": ans}])
@@ -188,60 +187,77 @@ def get_gemini_response(client, user_text):
         role = "user" if msg["role"] == "user" else "model"
         history_copy.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
     history_copy.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
-    
-    config = types.GenerateContentConfig(system_instruction="You are a fast, minimalist assistant. Answer in 1 or 2 short sentences.")
+    config = types.GenerateContentConfig(system_instruction="You are a fast, minimalist assistant. Answer in 1 or 2 sentences.")
     response = client.models.generate_content(model='gemini-2.5-flash', contents=history_copy, config=config)
     ans = response.text
     conversation_history.extend([{"role": "user", "content": user_text}, {"role": "assistant", "content": ans}])
     return ans
 
-def process_query_master(user_text):
-    """Dynamic Fallback Chain with Prioritized Randomizer"""
-    
-    # 1. OFFLINE FORK
-    if not check_internet():
-        log_msg("Offline Mode Active.", "WARNING")
-        ans = get_offline_definition(user_text)
-        return ans if ans else "I am currently offline. I can only provide dictionary definitions right now."
+def get_ddg_ai_response(user_text):
+    results = DDGS().chat(f"{user_text} (Answer contextually in 1 or 2 sentences max.)", model='gpt-4o-mini')
+    if results: return results.strip()
+    raise ValueError("Empty frame from DDG layer.")
 
-    # 2. ONLINE WATERFALL (Shuffle pools for load balancing)
-    active_groqs = list(groq_clients)
+def process_query_master(user_text):
+    global key_fail_counts, barge_in_triggered
+    if not check_internet():
+        ans = get_offline_definition(user_text)
+        return ans if ans else "System is offline. Local database returned empty content."
+
+    active_groqs = [node for node in groq_clients if key_fail_counts[node["id"]] < 2]
+    active_geminis = [node for node in gemini_clients if key_fail_counts[node["id"]] < 2]
+
+    if not active_groqs:
+        for node in groq_clients: key_fail_counts[node["id"]] = 0
+        active_groqs = list(groq_clients)
+    if not active_geminis:
+        for node in gemini_clients: key_fail_counts[node["id"]] = 0
+        active_geminis = list(gemini_clients)
+
     random.shuffle(active_groqs)
-    
-    active_geminis = list(gemini_clients)
     random.shuffle(active_geminis)
 
-    # Tier 1: Try all Groq nodes sequentially
-    for i, current_client in enumerate(active_groqs):
-        # 1.0s timeout for the very first attempt, 2.0s for the backups
-        timeout_val = 1.0 if i == 0 else 2.0 
+    for i, node in enumerate(active_groqs):
+        if barge_in_triggered: return None
+        timeout_val = 5.0 if i == 0 else 6.0 
         try:
-            log_msg(f"Attempting Groq Node {i+1} ({timeout_val}s limit)...", "INFO")
-            return run_with_timeout(get_groq_response, timeout_val, current_client, user_text, timeout_val)
+            log_msg(f"Attempting {node['id']} ({timeout_val}s limit)...", "INFO")
+            result = run_with_timeout(get_groq_response, timeout_val, node["client"], user_text, timeout_val)
+            key_fail_counts[node["id"]] = 0
+            return result
         except Exception as e:
-            log_msg(f"Groq Node {i+1} Failed: {e}", "ERROR")
+            key_fail_counts[node["id"]] += 1
+            log_msg(f"{node['id']} Failed: {e}", "ERROR")
 
-    # Tier 2: Try all Gemini nodes sequentially IF Groq is totally down
-    for i, current_client in enumerate(active_geminis):
+    if not barge_in_triggered:
         try:
-            log_msg(f"Attempting Gemini Node {i+1} (4.0s limit)...", "INFO")
-            return run_with_timeout(get_gemini_response, 4.0, current_client, user_text)
-        except Exception as e:
-            log_msg(f"Gemini Node {i+1} Failed: {e}", "ERROR")
+            log_msg("Routing request to DuckDuckGo Public Layer...", "INFO")
+            return run_with_timeout(get_ddg_ai_response, 8.0, user_text)
+        except Exception as ddg_err:
+            log_msg(f"DuckDuckGo Public Layer Failed: {ddg_err}", "ERROR")
 
-    # Tier 3: The Absolute Failsafe
+    for node in active_geminis:
+        if barge_in_triggered: return None
+        try:
+            log_msg(f"Attempting {node['id']} (4.0s limit)...", "INFO")
+            result = run_with_timeout(get_gemini_response, 4.0, node["client"], user_text)
+            key_fail_counts[node["id"]] = 0
+            return result
+        except Exception as e:
+            key_fail_counts[node["id"]] += 1
+            log_msg(f"{node['id']} Failed: {e}", "ERROR")
+
     ans = get_offline_definition(user_text)
-    if ans:
-        log_msg("All cloud APIs down. NLTK Definition matched.", "SUCCESS")
-        return ans
-        
-    return "Sorry, all cloud servers are unreachable right now."
+    return ans if ans else "All network nodes and search fallback clusters are unreachable."
 
 
-# --- 4. DRAGGABLE NATIVE HUD ---
-def display_response(initial_query=None, initial_answer=None):
-    global is_widget_open, dictation_enabled
-    is_widget_open = True
+# --- 4. HUD INTERFACE CONTAINER ---
+def display_response():
+    global is_widget_open, dictation_enabled, barge_in_triggered, widget_command_queue
+    
+    with state_lock:
+        is_widget_open = True
+        barge_in_triggered = False  
     
     root = ctk.CTk()
     root.overrideredirect(True)
@@ -262,9 +278,11 @@ def display_response(initial_query=None, initial_answer=None):
 
     def safe_close():
         global is_widget_open
-        is_widget_open = False
+        with state_lock: is_widget_open = False
         log_msg("Closing Widget.", "INFO")
-        for after_id in root.tk.eval('after info').split(): root.after_cancel(after_id)
+        for after_id in root.tk.eval('after info').split():
+            try: root.after_cancel(after_id)
+            except Exception: pass
         root.quit()
         root.destroy()
 
@@ -282,7 +300,7 @@ def display_response(initial_query=None, initial_answer=None):
     panel = ctk.CTkFrame(root, corner_radius=12, fg_color="#1E1E1E", bg_color=TRANSPARENT_COLOR, border_width=1, border_color="#333333")
     panel.pack(fill="both", expand=True, padx=12, pady=12)
 
-    toolbar = ctk.CTkFrame(panel, corner_radius=12, fg_color="#2D2D2D", height=35)
+    toolbar = ctk.CTkFrame(panel, corner_radius=12, fg_color="#2D2D2D", bg_color="#1E1E1E", height=35)
     toolbar.pack(fill="x", padx=0, pady=0)
     toolbar.pack_propagate(False) 
 
@@ -293,29 +311,19 @@ def display_response(initial_query=None, initial_answer=None):
     btn_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
     btn_frame.pack(side="left", padx=12)
     
-    close_btn = ctk.CTkButton(
-        btn_frame, text="", width=12, height=12, corner_radius=6, 
-        fg_color="#FF5F56", hover_color="#C93F3A", command=safe_close, font=("Arial", 11, "bold") 
-    )
+    close_btn = ctk.CTkButton(btn_frame, text="", width=12, height=12, corner_radius=6, 
+                              fg_color="#FF5F56", hover_color="#C93F3A", command=safe_close, font=("Arial", 11, "bold"))
     close_btn.pack(side="left", padx=4)
 
-    def on_enter_close(e): close_btn.configure(text="×", text_color="#330000") 
-    def on_leave_close(e): close_btn.configure(text="")
-    close_btn.bind("<Enter>", on_enter_close)
-    close_btn.bind("<Leave>", on_leave_close)
+    close_btn.bind("<Enter>", lambda e: close_btn.configure(text="×", text_color="#330000"))
+    close_btn.bind("<Leave>", lambda e: close_btn.configure(text=""))
     
     for color in ["#FFBD2E", "#27C93F"]:
         ctk.CTkFrame(btn_frame, width=12, height=12, corner_radius=6, fg_color=color).pack(side="left", padx=4)
 
-    # --- OPACITY SLIDER ---
-    def change_opacity(val):
-        root.attributes("-alpha", float(val))
-    
-    opacity_slider = ctk.CTkSlider(
-        toolbar, from_=0.2, to=1.0, width=60, height=10, 
-        command=change_opacity, border_width=0, 
-        button_color="#555555", button_hover_color="#777777", progress_color="#888888"
-    )
+    def change_opacity(val): root.attributes("-alpha", float(val))
+    opacity_slider = ctk.CTkSlider(toolbar, from_=0.2, to=1.0, width=60, height=10, command=change_opacity, border_width=0, 
+                                   button_color="#555555", button_hover_color="#777777", progress_color="#888888")
     opacity_slider.set(1.0)
     opacity_slider.pack(side="left", padx=(15, 5))
 
@@ -329,21 +337,14 @@ def display_response(initial_query=None, initial_answer=None):
             dictation_btn.configure(text="🔇", fg_color="#FF0000", hover_color="#CC0000")
             pygame.mixer.music.set_volume(0.0) 
 
-    initial_color = "#008000" if dictation_enabled else "#FF0000"
-    initial_icon = "🔊" if dictation_enabled else "🔇"
-
-    dictation_btn = ctk.CTkButton(
-        toolbar, text=initial_icon, width=26, height=26, corner_radius=13, 
-        font=("Segoe UI Emoji", 14), text_color="#FFFFFF",
-        fg_color=initial_color, hover_color="#333333", command=toggle_dictation
-    )
+    dictation_btn = ctk.CTkButton(toolbar, text="🔊" if dictation_enabled else "🔇", width=26, height=26, corner_radius=13, 
+                                  font=("Segoe UI Emoji", 14), text_color="#FFFFFF", fg_color="#008000" if dictation_enabled else "#FF0000", 
+                                  hover_color="#333333", command=toggle_dictation)
     dictation_btn.pack(side="right", padx=(5, 5))
 
-    mic_btn = ctk.CTkButton(
-        toolbar, text="● Mic Off", font=("Consolas", 11, "bold"), text_color="#AAAAAA",
-        fg_color="#3A3A3A", hover_color="#4A4A4A", corner_radius=5, width=95, height=24,
-        command=lambda: trigger_followup()
-    )
+    mic_btn = ctk.CTkButton(toolbar, text="● Mic Off", font=("Consolas", 11, "bold"), text_color="#AAAAAA",
+                            fg_color="#3A3A3A", hover_color="#4A4A4A", corner_radius=5, width=95, height=24,
+                            command=lambda: trigger_followup_or_interrupt())
     mic_btn.pack(side="right", padx=(5, 10))
 
     body = ctk.CTkFrame(panel, fg_color="transparent")
@@ -372,21 +373,38 @@ def display_response(initial_query=None, initial_answer=None):
         root.geometry(f"{window_width}x{new_height}+{pos['x']}+{pos['y']}")
 
     def reset_close_timer(seconds=8):
-        if close_timer_id[0]: root.after_cancel(close_timer_id[0])
+        if close_timer_id[0]: 
+            try: root.after_cancel(close_timer_id[0])
+            except Exception: pass
         close_timer_id[0] = root.after(seconds * 1000, safe_close)
 
+    def process_queue_events():
+        """Periodically checks if the background thread handed over a payload."""
+        global widget_command_queue
+        if widget_command_queue:
+            cmd = widget_command_queue.pop(0)
+            if cmd['action'] == 'start_sequence':
+                safe_gui(run_sequence, cmd['q'], cmd['a'], cmd['is_followup'], cmd['skip_typing'])
+            elif cmd['action'] == 'close':
+                safe_close()
+        
+        # Reschedule check every 100ms
+        if is_widget_open:
+            root.after(100, process_queue_events)
+
     def run_sequence(q_str, a_str, is_followup=False, skip_query_typing=False):
-        if close_timer_id[0]: root.after_cancel(close_timer_id[0])
+        if close_timer_id[0]: 
+            try: root.after_cancel(close_timer_id[0])
+            except Exception: pass
         safe_gui(mic_btn.configure, text="● Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
         if not skip_query_typing: safe_gui(query_label.configure, text="")
         safe_gui(response_label.configure, text="")
         
         if not is_followup: a_str = f"Hey {USER_NAME}, {a_str}"
-            
-        q_idx = [0]
-        r_idx = [0]
+        q_idx, r_idx = [0], [0]
         
         def type_query():
+            if barge_in_triggered: return
             if q_idx[0] < len(q_str):
                 query_label.configure(text=q_str[:q_idx[0]+1] + "█")
                 q_idx[0] += 1
@@ -396,6 +414,7 @@ def display_response(initial_query=None, initial_answer=None):
                 start_response_phase()
 
         def start_response_phase():
+            if barge_in_triggered: return
             if dictation_enabled:
                 response_label.configure(text="Thinking...█")
                 generate_audio(a_str, on_audio_ready)
@@ -404,11 +423,13 @@ def display_response(initial_query=None, initial_answer=None):
                 type_response()
 
         def on_audio_ready(filepath):
+            if barge_in_triggered: return
             safe_gui(response_label.configure, text="") 
             play_and_cleanup(filepath, audio_finished_callback)
             safe_gui(type_response)
 
         def type_response():
+            if barge_in_triggered: return
             if r_idx[0] < len(a_str):
                 current_t = a_str[:r_idx[0]+1]
                 update_height(len(current_t))
@@ -418,15 +439,18 @@ def display_response(initial_query=None, initial_answer=None):
                 root.after(delay, type_response)
             else:
                 response_label.configure(text=a_str)
-                if not dictation_enabled: root.after(500, activate_listening_ui)
+                if not dictation_enabled and not barge_in_triggered: 
+                    root.after(500, activate_listening_ui)
 
         def audio_finished_callback():
-            safe_gui(activate_listening_ui)
+            if not barge_in_triggered:
+                safe_gui(activate_listening_ui)
 
         if skip_query_typing: start_response_phase()
         else: type_query()
 
     def activate_listening_ui(is_first=False):
+        if barge_in_triggered: return
         mic_btn.configure(text="● Listening", fg_color="#FF5F56", text_color="#FFFFFF")
         reset_close_timer(10)
         threading.Thread(target=lambda: listen_for_followup(is_first), daemon=True).start()
@@ -436,82 +460,117 @@ def display_response(initial_query=None, initial_answer=None):
             recognizer.adjust_for_ambient_noise(source, duration=0.3)
             try:
                 audio_capture = recognizer.listen(source, timeout=5, phrase_time_limit=5)
+                if barge_in_triggered: return
                 safe_gui(mic_btn.configure, text="● Transcribing", fg_color="#FFBD2E", text_color="#000000")
                 
-                # --- HYBRID OFFLINE/ONLINE STT ---
                 followup_q = ""
                 if check_internet():
-                    try:
-                        followup_q = recognizer.recognize_google(audio_capture).strip()
+                    try: followup_q = recognizer.recognize_google(audio_capture).strip()
                     except sr.RequestError:
-                        log_msg("Google STT API Failed. Falling back to Vosk.", "WARNING")
-                        res = json.loads(recognizer.recognize_vosk(audio_capture, model_path=VOSK_MODEL_PATH))
+                        res = json.loads(recognizer.recognize_vosk(audio_capture))
                         followup_q = res.get("text", "").strip()
                 else:
-                    log_msg("Wi-Fi Dead. Using offline Vosk transcription.", "WARNING")
-                    res = json.loads(recognizer.recognize_vosk(audio_capture, model_path=VOSK_MODEL_PATH))
+                    res = json.loads(recognizer.recognize_vosk(audio_capture))
                     followup_q = res.get("text", "").strip()
-                # ---------------------------------
 
                 log_msg(f"Heard: '{followup_q}'", "INFO")
                 
-                if followup_q:
+                if followup_q and not barge_in_triggered:
                     safe_gui(query_label.configure, text="")
                     safe_gui(mic_btn.configure, text="● Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
                     try:
                         answer = process_query_master(followup_q)
-                        safe_gui(run_sequence, followup_q, answer, not is_first, False)
+                        if not barge_in_triggered:
+                            safe_gui(run_sequence, followup_q, answer, not is_first, False)
                     except Exception as e:
-                        log_msg(f"Critical System Error: {e}", "ERROR")
-                        safe_gui(response_label.configure, text="System Failure.")
-                        if close_timer_id[0]: safe_gui(root.after_cancel, close_timer_id[0])
-                        safe_gui(root.after, 4000, safe_close)
-            
-            except sr.WaitTimeoutError:
-                log_msg("Listening timed out.", "WARNING")
-                safe_gui(safe_close)
-            except Exception as e:
-                log_msg(f"Speech processing error: {e}", "WARNING")
-                safe_gui(safe_close)
+                        log_msg(f"Pipeline failure: {e}", "ERROR")
+                        safe_gui(safe_close)
+                else:
+                    safe_gui(safe_close)
+            except Exception: safe_gui(safe_close)
 
-    def trigger_followup():
+    def trigger_followup_or_interrupt():
+        global barge_in_triggered
+        current_state = mic_btn.cget("text")
+        
+        if current_state in ["● Processing", "● Transcribing"] or pygame.mixer.music.get_busy():
+            log_msg("Barge-in triggered by user button tap! Interrupting...", "WARNING")
+            with state_lock: barge_in_triggered = True
+            if pygame.mixer.music.get_busy(): pygame.mixer.music.stop()
+            mic_btn.configure(text="● Listening", fg_color="#FF5F56", text_color="#FFFFFF")
+            response_label.configure(text="")
+            query_label.configure(text="")
+            root.after(100, lambda: reset_barge_flag_and_listen())
+        else:
+            reset_close_timer(10)
+            activate_listening_ui(is_first=False)
+
+    def reset_barge_flag_and_listen():
+        global barge_in_triggered
+        with state_lock: barge_in_triggered = False
         reset_close_timer(10)
-        activate_listening_ui(is_first=False)
+        threading.Thread(target=lambda: listen_for_followup(False), daemon=True).start()
 
     root.attributes("-alpha", 1.0)
-    
-    if initial_query and initial_answer:
-        root.after(10, lambda: run_sequence(initial_query, initial_answer, is_followup=False))
-    else:
-        root.after(10, lambda: activate_listening_ui(is_first=True))
-        
+    root.after(100, process_queue_events) # Start checking the queue
+    root.after(10, activate_listening_ui) # Instantly set UI to listening
     root.mainloop()
 
-# --- 5. MAIN WAKE LOOP ---
-log_msg(f"Agent online. Configured User: '{USER_NAME}' | Wake word: '{WAKE_WORD}'", "SUCCESS")
+
+# --- INITIAL WAKE CAPTURE ROUTINE ---
+def capture_initial_query():
+    """Runs securely in the background while the UI handles rendering."""
+    global widget_command_queue
+    with sr.Microphone() as source:
+        recognizer.adjust_for_ambient_noise(source, duration=0.4)
+        try:
+            audio_capture = recognizer.listen(source, timeout=4, phrase_time_limit=6)
+            q = ""
+            if check_internet():
+                try: q = recognizer.recognize_google(audio_capture).strip()
+                except sr.RequestError:
+                    res = json.loads(recognizer.recognize_vosk(audio_capture))
+                    q = res.get("text", "").strip()
+            else:
+                res = json.loads(recognizer.recognize_vosk(audio_capture))
+                q = res.get("text", "").strip()
+            
+            if q:
+                log_msg(f"Processing Query: {q}", "INFO")
+                r = process_query_master(q)
+                if r:
+                    widget_command_queue.append({
+                        'action': 'start_sequence', 'q': q, 'a': r, 'is_followup': False, 'skip_typing': False
+                    })
+            else:
+                widget_command_queue.append({'action': 'close'})
+        except Exception as e:
+            log_msg(f"Initial capture aborted: {e}", "WARNING")
+            widget_command_queue.append({'action': 'close'})
+
+
+# --- 5. SYSTEM MAIN WAKE LOOP ---
+log_msg(f"Agent initialized successfully. Tracking profile: '{USER_NAME}' | Wake: '{WAKE_WORD}'", "SUCCESS")
 
 while True:
     try:
         if not is_widget_open:
-            if mic_stream.is_stopped():
-                mic_stream.start_stream()
-
+            if mic_stream.is_stopped(): mic_stream.start_stream()
             audio_data = mic_stream.read(1280, exception_on_overflow=False)
             audio_frame = np.frombuffer(audio_data, dtype=np.int16)
             prediction = model.predict(audio_frame)
             
             if model.prediction_buffer[WAKE_WORD][-1] > 0.5:
-                log_msg(f"Detected wake phrase: '{WAKE_WORD}'", "TRIGGER")
+                log_msg(f"System Trigger match event: '{WAKE_WORD}'", "TRIGGER")
                 mic_stream.stop_stream()
                 model.reset()
                 
+                # 1. Fire off the background audio capture
+                threading.Thread(target=capture_initial_query, daemon=True).start()
+                
+                # 2. Open the UI INSTANTLY
                 display_response()
                 time.sleep(1)
-        else:
-            time.sleep(0.5)
-
-    except KeyboardInterrupt:
-        log_msg("Shutting down assistant...", "INFO")
-        break
-    except Exception:
-        time.sleep(1)
+        else: time.sleep(0.5)
+    except KeyboardInterrupt: break
+    except Exception: time.sleep(1)
