@@ -60,6 +60,7 @@ class AssistantAlexa:
         self.config = service.config
         self.root = None
         self.window_width = 440
+        self.window_height = 130
         self.transparent_color = "#000001"
         self.position = None
         self.close_timer_id = [None]
@@ -84,7 +85,29 @@ class AssistantAlexa:
 
         screen_width = self.root.winfo_screenwidth()
         self.position = {"x": screen_width - self.window_width - 25, "y": 60, "drag_x": 0, "drag_y": 0}
-        self.root.geometry(f"{self.window_width}x130+{self.position['x']}+{self.position['y']}")
+        self._apply_geometry()
+
+    def _apply_geometry(self):
+        if not self.root or not self.root.winfo_exists() or not self.position:
+            return
+        self.root.geometry(f"{self.window_width}x{self.window_height}+{self.position['x']}+{self.position['y']}")
+
+    def set_position(self, x, y):
+        if self.position is None:
+            self.position = {"x": int(x), "y": int(y), "drag_x": 0, "drag_y": 0}
+            return
+
+        if self.root and self.root.winfo_exists():
+            screen_width = self.root.winfo_screenwidth()
+            screen_height = self.root.winfo_screenheight()
+            max_x = max(0, screen_width - self.window_width)
+            max_y = max(0, screen_height - self.window_height)
+            self.position["x"] = max(0, min(int(x), max_x))
+            self.position["y"] = max(0, min(int(y), max_y))
+            self._apply_geometry()
+        else:
+            self.position["x"] = int(x)
+            self.position["y"] = int(y)
 
     def _safe_gui(self, func, *args, **kwargs):
         if self.service.is_widget_open and self.root and self.root.winfo_exists():
@@ -152,15 +175,11 @@ class AssistantAlexa:
             root.after(1, _teardown)
 
     def _start_move(self, event):
-        self.position["drag_x"] = event.x
-        self.position["drag_y"] = event.y
+        self.position["drag_x"] = event.x_root - self.position["x"]
+        self.position["drag_y"] = event.y_root - self.position["y"]
 
     def _move_window(self, event):
-        delta_x = event.x - self.position["drag_x"]
-        delta_y = event.y - self.position["drag_y"]
-        self.position["x"] = self.root.winfo_x() + delta_x
-        self.position["y"] = self.root.winfo_y() + delta_y
-        self.root.geometry(f"+{self.position['x']}+{self.position['y']}")
+        self.set_position(event.x_root - self.position["drag_x"], event.y_root - self.position["drag_y"])
 
     def _change_opacity(self, value):
         self.root.attributes("-alpha", float(value))
@@ -226,8 +245,8 @@ class AssistantAlexa:
 
     def _update_height(self, text_len):
         lines = (text_len // 50) + 1
-        new_height = 135 + (lines * 22)
-        self.root.geometry(f"{self.window_width}x{new_height}+{self.position['x']}+{self.position['y']}")
+        self.window_height = 135 + (lines * 22)
+        self._apply_geometry()
 
     def _transcribe_followup(self, timeout=5):
         with sr.Microphone() as source:
@@ -702,6 +721,8 @@ class AssistantAlexa:
         # Prompt frame (user text line)
         prompt_frame = ctk.CTkFrame(body, fg_color="transparent")
         prompt_frame.pack(fill="x", anchor="w")
+        prompt_frame.bind("<ButtonPress-1>", self._start_move)
+        prompt_frame.bind("<B1-Motion>", self._move_window)
 
         # Console-style user line formatting
         ctk.CTkLabel(prompt_frame, text=f"{self.config.user_name}:", font=("Consolas", 13, "bold"), text_color="#00FF9C").pack(side="left")
@@ -714,6 +735,8 @@ class AssistantAlexa:
         # Response label (typing area)
         response_label = ctk.CTkLabel(body, text="", font=("Consolas", 13), text_color="#CCCCCC", justify="left", wraplength=370)
         response_label.pack(anchor="w", pady=(10, 0))
+        response_label.bind("<ButtonPress-1>", self._start_move)
+        response_label.bind("<B1-Motion>", self._move_window)
 
         # Register widgets with updated names
         self.widgets = {"status_pill": status_pill, "query_label": query_label, "response_label": response_label}

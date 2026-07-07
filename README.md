@@ -23,6 +23,14 @@ The project is split into small modules so the UI, runtime loop, configuration, 
 - Online response routing with fallback behavior for simple definition-style queries.
 - Alexa controls for theme switching, pinning, closing, opacity adjustment, and audio mute/unmute.
 
+## Two Themes
+
+The interface includes two visual themes and can be used as a wonderful overlaying dictionary as well.
+
+| Theme 1 | Theme 2 |
+| --- | --- |
+| ![Theme 1](screenshots/Screenshot%202026-07-06%20213700.png) | ![Theme 2](screenshots/Screenshot%202026-07-06%20224955.png) |
+
 ## Alexa Controls
 
 The floating Alexa uses color-coded controls so the interaction stays simple:
