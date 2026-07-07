@@ -78,6 +78,8 @@ class AssistantAlexa:
         self.active_token = 0
         self.listening_active = False
         self.is_pinned = False
+        self._meeting_prev_pinned = False
+        self._meeting_prev_dictation = True
 
     def _build_window(self):
         self.root = ctk.CTk()
@@ -128,6 +130,8 @@ class AssistantAlexa:
         if self.is_pinned and not force:
             log_msg("Close suppressed - widget is pinned.", "INFO")
             return
+        if force and self.service.meeting_mode_enabled:
+            self.service.stop_meeting_mode()
         self.is_pinned = False
         with self.service.state_lock:
             self.service.is_widget_open = False
@@ -273,6 +277,15 @@ class AssistantAlexa:
                 fg_color=theme["dictation_off_color"],
                 hover_color=theme["dictation_off_hover"],
             )
+
+        meeting_pill = w["meeting_pill"]
+        meeting_pill.configure(font=(theme["dictation_font"], 14))
+        if not self.service.system_audio_available:
+            meeting_pill.configure(fg_color="#555555", hover_color="#555555", text_color="#888888")
+        elif self.service.meeting_mode_enabled:
+            meeting_pill.configure(fg_color=theme["dictation_on_color"], hover_color=theme["dictation_on_hover"], text_color="#FFFFFF")
+        else:
+            meeting_pill.configure(fg_color=theme["idle_pill_bg"], hover_color="#444444", text_color="#FFFFFF")
 
     def _reset_close_timer(self, seconds=8):
         if self.is_pinned:
@@ -713,16 +726,18 @@ class AssistantAlexa:
 
         # UPDATED: The new pill-shaped green speaker button on the far right
         # Style mapped to image: green pill, white speaker icon.
-        def toggle_dictation():
-            self.service.dictation_enabled = not self.service.dictation_enabled
+        def _sync_speaker_pill():
             active_theme = self.THEMES[self.theme]
             if self.service.dictation_enabled:
                 speaker_pill.configure(text="🔊", fg_color=active_theme["dictation_on_color"], hover_color=active_theme["dictation_on_hover"])
-                pygame.mixer.music.set_volume(1.0)
             else:
                 icon = "🔇" if active_theme["dictation_swap_icon"] else "🔊"
                 speaker_pill.configure(text=icon, fg_color=active_theme["dictation_off_color"], hover_color=active_theme["dictation_off_hover"])
-                pygame.mixer.music.set_volume(0.0)
+
+        def toggle_dictation():
+            self.service.dictation_enabled = not self.service.dictation_enabled
+            pygame.mixer.music.set_volume(1.0 if self.service.dictation_enabled else 0.0)
+            _sync_speaker_pill()
 
         # Speaker emoji "🔊" as icon, green pill style
         speaker_pill = ctk.CTkButton(
@@ -738,6 +753,60 @@ class AssistantAlexa:
             command=toggle_dictation,
         )
         speaker_pill.pack(side="right", padx=(5, 5))
+
+        # Meeting mode toggle: switches listening source to system/loopback
+        # audio (e.g. a call's speaker output) so the assistant can answer
+        # questions it overhears in a meeting instead of the user's mic.
+        # Forces the widget pinned open and mutes TTS while active so
+        # answers only ever show as text and never talk over the call.
+        def _sync_meeting_pill():
+            active_theme = self.THEMES[self.theme]
+            if not self.service.system_audio_available:
+                meeting_pill.configure(text="🖥", fg_color="#555555", hover_color="#555555", text_color="#888888")
+            elif self.service.meeting_mode_enabled:
+                meeting_pill.configure(text="🖥", fg_color=active_theme["dictation_on_color"], hover_color=active_theme["dictation_on_hover"], text_color="#FFFFFF")
+            else:
+                meeting_pill.configure(text="🖥", fg_color=active_theme["idle_pill_bg"], hover_color="#444444", text_color="#FFFFFF")
+
+        def toggle_meeting_mode():
+            if not self.service.system_audio_available:
+                log_msg("Meeting mode unavailable - no WASAPI loopback device found.", "WARNING")
+                return
+            if self.service.meeting_mode_enabled:
+                self.service.stop_meeting_mode()
+                self.is_pinned = self._meeting_prev_pinned
+                if not self.is_pinned:
+                    self._reset_close_timer(10)
+                self.service.dictation_enabled = self._meeting_prev_dictation
+                pygame.mixer.music.set_volume(1.0 if self.service.dictation_enabled else 0.0)
+            else:
+                self._meeting_prev_pinned = self.is_pinned
+                self._meeting_prev_dictation = self.service.dictation_enabled
+                self.is_pinned = True
+                if self.close_timer_id[0]:
+                    try:
+                        self.root.after_cancel(self.close_timer_id[0])
+                    except Exception:
+                        pass
+                    self.close_timer_id[0] = None
+                self.service.dictation_enabled = False
+                pygame.mixer.music.set_volume(0.0)
+                self.service.start_meeting_mode()
+            _sync_meeting_pill()
+            _sync_speaker_pill()
+
+        meeting_pill = ctk.CTkButton(
+            header,
+            text="🖥",
+            font=(theme["dictation_font"], 14),
+            text_color="#FFFFFF",
+            corner_radius=13,
+            width=30,
+            height=26,
+            command=toggle_meeting_mode,
+        )
+        meeting_pill.pack(side="right", padx=(5, 5))
+        _sync_meeting_pill()
 
         # UPDATED: Pill-shaped status button (replacing mic_btn) with text "• Mic Off"
         # Style mapped to image: dark, pill shape. targeted by statuses like Processing.
@@ -811,6 +880,7 @@ class AssistantAlexa:
             "header": header,
             "opacity_slider": opacity_slider,
             "speaker_pill": speaker_pill,
+            "meeting_pill": meeting_pill,
             "status_pill": status_pill,
         }
 

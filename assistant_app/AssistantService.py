@@ -1,4 +1,5 @@
 import asyncio
+import audioop
 from collections import deque
 import io
 import os
@@ -24,6 +25,11 @@ from groq import Groq
 from google import genai
 from google.genai import types
 import pyaudio
+
+try:
+    import pyaudiowpatch
+except ImportError:
+    pyaudiowpatch = None
 warnings.filterwarnings(
     "ignore",
     message=r"pkg_resources is deprecated as an API.*",
@@ -43,6 +49,61 @@ from .AppConfig import AppConfig
 from .Logger import log_msg
 
 
+class _LoopbackAudioSource(sr.AudioSource):
+    # Subclasses AudioSource purely so isinstance() checks inside
+    # speech_recognition pass (its own __init__ is never called); the rest
+    # of the interface (SAMPLE_WIDTH, SAMPLE_RATE, CHUNK, stream.read/close)
+    # is duck-typed the same way sr.Microphone does it, so recognizer.listen()
+    # and adjust_for_ambient_noise() work against a WASAPI loopback device.
+    class _Stream:
+        def __init__(self, pyaudio_stream, channels):
+            self.pyaudio_stream = pyaudio_stream
+            self.channels = channels
+
+        def read(self, size):
+            data = self.pyaudio_stream.read(size, exception_on_overflow=False)
+            if self.channels > 1:
+                # Downmix to mono so the byte-rate matches what AudioData /
+                # get_wav_data() (which always writes a 1-channel WAV) expect.
+                data = audioop.tomono(data, 2, 0.5, 0.5)
+            return data
+
+        def close(self):
+            try:
+                if not self.pyaudio_stream.is_stopped():
+                    self.pyaudio_stream.stop_stream()
+            finally:
+                self.pyaudio_stream.close()
+
+    def __init__(self, pyaudio_instance, device_info, chunk_size=1024):
+        self._pa = pyaudio_instance
+        self._device_info = device_info
+        self.SAMPLE_WIDTH = pyaudiowpatch.get_sample_size(pyaudiowpatch.paInt16)
+        self.SAMPLE_RATE = int(device_info["defaultSampleRate"])
+        self.channels = max(1, int(device_info["maxInputChannels"]))
+        self.CHUNK = chunk_size
+        self.stream = None
+
+    def __enter__(self):
+        pyaudio_stream = self._pa.open(
+            format=pyaudiowpatch.paInt16,
+            channels=self.channels,
+            rate=self.SAMPLE_RATE,
+            input=True,
+            input_device_index=self._device_info["index"],
+            frames_per_buffer=self.CHUNK,
+        )
+        self.stream = self._Stream(pyaudio_stream, self.channels)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if self.stream:
+                self.stream.close()
+        finally:
+            self.stream = None
+
+
 class AssistantService:
     def __init__(self, config: AppConfig):
         self.config = config
@@ -57,6 +118,12 @@ class AssistantService:
         self.is_widget_open = False
         self.dictation_enabled = True
         self.barge_in_triggered = False
+        self.meeting_mode_enabled = False
+        self.meeting_listener_thread = None
+        self.meeting_open_request = threading.Event()
+        self._keepalive_stream = None
+        self._keepalive_thread = None
+        self._keepalive_stop = threading.Event()
         self.widget_command_queue = queue.Queue()
         self.conversation_history = deque(maxlen=self.config.max_exchanges * 2)
         self.key_fail_counts: dict[str, int] = {}
@@ -82,6 +149,28 @@ class AssistantService:
             input=True,
             frames_per_buffer=1280,
         )
+
+        self.system_audio_available = False
+        self.loopback_audio = None
+        self.loopback_device_info = None
+        self.keepalive_device_info = None
+        if pyaudiowpatch is not None:
+            try:
+                self.loopback_audio = pyaudiowpatch.PyAudio()
+                self.loopback_device_info = self.loopback_audio.get_default_wasapi_loopback()
+                self.system_audio_available = True
+            except Exception as exc:
+                self.log(f"System audio (meeting mode) capture unavailable: {exc}", "WARNING")
+                if self.loopback_audio:
+                    self.loopback_audio.terminate()
+                self.loopback_audio = None
+            if self.system_audio_available:
+                try:
+                    self.keepalive_device_info = self.loopback_audio.get_default_wasapi_device(d_out=True)
+                except Exception as exc:
+                    self.log(f"Meeting-mode keepalive device lookup failed: {exc}", "WARNING")
+        else:
+            self.log("PyAudioWPatch not installed - meeting mode (system audio) disabled.", "WARNING")
 
         self.groq_clients = []
         for index, key in enumerate(config.groq_keys, start=1):
@@ -271,6 +360,134 @@ class AssistantService:
             audio_capture = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
             return self.transcribe_audio(audio_capture)
 
+    def capture_system_audio_text(self, timeout=4, phrase_time_limit=12, ambient_noise=0.4):
+        with _LoopbackAudioSource(self.loopback_audio, self.loopback_device_info) as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=ambient_noise)
+            audio_capture = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
+            return self.transcribe_audio(audio_capture)
+
+    def _start_keepalive(self):
+        # WASAPI shared-mode loopback only delivers buffers while the audio
+        # engine has an active render stream - with nothing playing on the
+        # speakers, reads block indefinitely regardless of any timeout.
+        # Writing silence to the default output keeps the engine "awake" so
+        # loopback capture keeps returning promptly even during gaps in the
+        # call's audio.
+        if not self.keepalive_device_info or self._keepalive_stream is not None:
+            return
+        try:
+            channels = min(2, max(1, int(self.keepalive_device_info.get("maxOutputChannels", 2) or 2)))
+            rate = int(self.keepalive_device_info["defaultSampleRate"])
+            self._keepalive_stream = self.loopback_audio.open(
+                format=pyaudiowpatch.paInt16,
+                channels=channels,
+                rate=rate,
+                output=True,
+                output_device_index=self.keepalive_device_info["index"],
+                frames_per_buffer=1024,
+            )
+            silence = b"\x00" * (1024 * channels * 2)
+            self._keepalive_stop.clear()
+
+            def _write_silence():
+                stream = self._keepalive_stream
+                while not self._keepalive_stop.is_set():
+                    try:
+                        stream.write(silence)
+                    except Exception:
+                        break
+
+            self._keepalive_thread = threading.Thread(target=_write_silence, daemon=True)
+            self._keepalive_thread.start()
+        except Exception as exc:
+            self.log(f"Meeting-mode keepalive stream failed to start: {exc}", "WARNING")
+            self._keepalive_stream = None
+
+    def _stop_keepalive(self):
+        self._keepalive_stop.set()
+        if self._keepalive_thread:
+            self._keepalive_thread.join(timeout=1)
+        self._keepalive_thread = None
+        if self._keepalive_stream is not None:
+            try:
+                self._keepalive_stream.stop_stream()
+                self._keepalive_stream.close()
+            except Exception:
+                pass
+            self._keepalive_stream = None
+
+    def start_meeting_mode(self):
+        if not self.system_audio_available or self.meeting_mode_enabled:
+            return
+        self.meeting_mode_enabled = True
+        self._start_keepalive()
+        self.meeting_listener_thread = threading.Thread(target=self._meeting_listener_loop, daemon=True)
+        self.meeting_listener_thread.start()
+        self.log("Meeting mode enabled - listening to system audio.", "SUCCESS")
+
+    def stop_meeting_mode(self):
+        self.meeting_mode_enabled = False
+        self._stop_keepalive()
+        self.log("Meeting mode disabled.", "INFO")
+
+    def _meeting_listener_loop(self):
+        # Held open for the whole meeting-mode session instead of being
+        # reopened per phrase - reopening a WASAPI stream every cycle adds
+        # noticeable latency and creates a gap right at the start of each
+        # capture where the first syllable can be clipped.
+        try:
+            source = _LoopbackAudioSource(self.loopback_audio, self.loopback_device_info)
+            source.__enter__()
+        except Exception as exc:
+            self.log(f"Meeting mode failed to open system audio stream: {exc}", "ERROR")
+            self.meeting_mode_enabled = False
+            return
+
+        try:
+            # Calibrated once up front rather than before every listen() -
+            # re-running it each cycle was burning a fixed ~0.4s per phrase
+            # for no benefit, since room/system noise doesn't shift that fast.
+            self.recognizer.adjust_for_ambient_noise(source, duration=0.6)
+            while self.meeting_mode_enabled:
+                try:
+                    audio_capture = self.recognizer.listen(source, timeout=4, phrase_time_limit=12)
+                except sr.WaitTimeoutError:
+                    continue
+                except Exception as exc:
+                    self.log(f"Meeting audio capture failed: {exc}", "WARNING")
+                    time.sleep(1)
+                    continue
+
+                # Transcription + LLM + display run on the shared worker pool
+                # so capturing the *next* phrase never blocks on answering the
+                # current one - otherwise anything said during that gap (a
+                # few seconds of STT/LLM/TTS latency) is simply never heard.
+                self.global_executor.submit(self._handle_meeting_phrase, audio_capture)
+        finally:
+            source.__exit__(None, None, None)
+
+    def _handle_meeting_phrase(self, audio_capture):
+        text = self.transcribe_audio(audio_capture)
+        if not text or not self.meeting_mode_enabled:
+            return
+
+        self.log(f"[Meeting] Heard: '{text}'", "INFO")
+        try:
+            answer = self.process_query_master(text)
+        except Exception as exc:
+            self.log(f"[Meeting] Pipeline failure: {exc}", "ERROR")
+            return
+
+        if not answer or not self.meeting_mode_enabled:
+            return
+
+        needs_open = not self.is_widget_open
+        self.widget_command_queue.put(
+            {"action": "start_sequence", "q": text, "a": answer, "is_followup": True, "skip_typing": False}
+        )
+        if needs_open:
+            self.meeting_open_request.set()
+
     def generate_audio(self, text, on_ready_callback):
         def write_online():
             try:
@@ -335,6 +552,8 @@ class AssistantService:
         threading.Thread(target=task, daemon=True).start()
 
     def shutdown(self):
+        self.meeting_mode_enabled = False
+        self._stop_keepalive()
         try:
             if self.mic_stream.is_active():
                 self.mic_stream.stop_stream()
@@ -346,6 +565,11 @@ class AssistantService:
             pass
         try:
             self.audio.terminate()
+        except Exception:
+            pass
+        try:
+            if self.loopback_audio:
+                self.loopback_audio.terminate()
         except Exception:
             pass
         try:

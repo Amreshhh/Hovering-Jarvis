@@ -28,6 +28,11 @@ def main():
         while True:
             try:
                 if not service.is_widget_open:
+                    if service.meeting_open_request.is_set():
+                        service.meeting_open_request.clear()
+                        Alexa.display_response()
+                        continue
+
                     if service.mic_stream.is_stopped():
                         service.mic_stream.start_stream()
 

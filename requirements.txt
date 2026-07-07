@@ -7,6 +7,7 @@ nltk>=3.9.1
 numpy>=2.0.0
 openwakeword>=0.6.0
 pyaudio>=0.2.14
+PyAudioWPatch>=0.2.12.7; platform_system == "Windows"
 pygame>=2.6.0
 pyttsx3>=2.98
 python-dotenv>=1.0.1

@@ -22,6 +22,7 @@ The project is split into small modules so the UI, runtime loop, configuration, 
 - Text-to-speech output with audio playback cleanup.
 - Online response routing with fallback behavior for simple definition-style queries.
 - Alexa controls for theme switching, pinning, closing, opacity adjustment, and audio mute/unmute.
+- Meeting mode: listens to the PC's own system/loopback audio (e.g. a Zoom or Teams call) instead of the microphone, transcribes what's said, and types the answer in the widget - handy for getting live answers to questions asked in a meeting.
 
 ## Two Themes
 
@@ -46,6 +47,7 @@ The floating Alexa uses color-coded controls so the interaction stays simple:
 - 🔴 Red button: closes the window.
 - Status pill: click while the assistant is processing or transcribing to barge in and interrupt the current response.
 - Opacity slider: adjusts the transparency of the Alexa window.
+- 🖥 Meeting-mode button: toggles listening to the PC's system audio (loopback) instead of the mic. While active, the Alexa is auto-pinned open and its own TTS is muted, so it just types out answers to whatever it hears in the call. Requires Windows with a WASAPI loopback device (`PyAudioWPatch`); the button is greyed out if unavailable.
 - Speaker button: mutes or unmutes assistant audio playback.
 
 ## Setup
