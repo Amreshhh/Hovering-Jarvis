@@ -27,9 +27,9 @@ The project is split into small modules so the UI, runtime loop, configuration, 
 
 The floating Alexa uses color-coded controls so the interaction stays simple:
 
-- Green button: toggles between the available themes.
-- Yellow button: pins or unpins the Alexa so it stays open.
-- Red button: closes the window.
+- 🟢 Green button: toggles between the available themes.
+- 🟡 Yellow button: pins or unpins the Alexa so it stays open.
+- 🔴 Red button: closes the window.
 - Status pill: click while the assistant is processing or transcribing to barge in and interrupt the current response.
 - Opacity slider: adjusts the transparency of the Alexa window.
 - Speaker button: mutes or unmutes assistant audio playback.
