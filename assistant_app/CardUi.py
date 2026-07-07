@@ -8,6 +8,53 @@ from .Logger import log_msg
 
 
 class AssistantHUD:
+    # theme1 is the original look; theme2 is a darker, more minimal "toolbar"
+    # look (separate-toned header bar, muted grayscale controls). Both share
+    # the exact same widget structure - only colors/fonts/labels differ - so
+    # toggling between them is a safe in-place reconfigure, never a rebuild.
+    THEMES = {
+        "theme1": {
+            "bullet": "•",
+            "panel_fg": "#6B6F73",
+            "panel_border": "#333333",
+            "header_fg": "#6B6F73",
+            "slider_track": "#333333",
+            "slider_button": "#CCCCCC",
+            "slider_button_hover": "#FFFFFF",
+            "slider_progress": "#ffbd44",
+            "idle_pill_bg": "#333333",
+            "idle_pill_text": "#AAAAAA",
+            "status_corner_radius": 6,
+            "status_height": 26,
+            "dictation_font": "Consolas",
+            "dictation_swap_icon": False,
+            "dictation_on_color": "#27C93F",
+            "dictation_on_hover": "#20A032",
+            "dictation_off_color": "#ff605c",
+            "dictation_off_hover": "#d04040",
+        },
+        "theme2": {
+            "bullet": "●",
+            "panel_fg": "#1E1E1E",
+            "panel_border": "#333333",
+            "header_fg": "#2D2D2D",
+            "slider_track": "#3A3A3A",
+            "slider_button": "#555555",
+            "slider_button_hover": "#777777",
+            "slider_progress": "#888888",
+            "idle_pill_bg": "#3A3A3A",
+            "idle_pill_text": "#AAAAAA",
+            "status_corner_radius": 5,
+            "status_height": 24,
+            "dictation_font": "Segoe UI Emoji",
+            "dictation_swap_icon": True,
+            "dictation_on_color": "#008000",
+            "dictation_on_hover": "#006400",
+            "dictation_off_color": "#FF0000",
+            "dictation_off_hover": "#CC0000",
+        },
+    }
+
     def __init__(self, service):
         self.service = service
         self.config = service.config
@@ -17,6 +64,8 @@ class AssistantHUD:
         self.position = None
         self.close_timer_id = [None]
         self.widgets = {}
+        self.theme_widgets = {}
+        self.theme = "theme1"
         self.active_token = 0
         self.listening_active = False
         self.is_pinned = False
@@ -116,6 +165,55 @@ class AssistantHUD:
     def _change_opacity(self, value):
         self.root.attributes("-alpha", float(value))
 
+    def _bullet(self):
+        return self.THEMES[self.theme]["bullet"]
+
+    def _apply_theme(self):
+        # Re-colors the already-built widgets in place - never rebuilds the
+        # window, so a theme toggle can't reintroduce the kind of crash a
+        # structural rebuild risks.
+        w = self.theme_widgets
+        if not w:
+            return
+        theme = self.THEMES[self.theme]
+        bullet = theme["bullet"]
+
+        w["panel"].configure(fg_color=theme["panel_fg"], border_color=theme["panel_border"])
+        w["header"].configure(fg_color=theme["header_fg"])
+        w["opacity_slider"].configure(
+            button_color=theme["slider_button"],
+            button_hover_color=theme["slider_button_hover"],
+            progress_color=theme["slider_progress"],
+            fg_color=theme["slider_track"],
+        )
+
+        status_pill = w["status_pill"]
+        status_pill.configure(corner_radius=theme["status_corner_radius"], height=theme["status_height"])
+        current_text = status_pill.cget("text")
+        if current_text.endswith("Mic Off"):
+            status_pill.configure(text=f"{bullet} Mic Off", fg_color=theme["idle_pill_bg"], text_color=theme["idle_pill_text"])
+        elif current_text.endswith("Processing"):
+            status_pill.configure(text=f"{bullet} Processing")
+        elif current_text.endswith("Transcribing"):
+            status_pill.configure(text=f"{bullet} Transcribing")
+        elif current_text.endswith("Listening"):
+            status_pill.configure(text=f"{bullet} Listening")
+
+        speaker_pill = w["speaker_pill"]
+        speaker_pill.configure(font=(theme["dictation_font"], 14))
+        if self.service.dictation_enabled:
+            speaker_pill.configure(
+                text="🔊",
+                fg_color=theme["dictation_on_color"],
+                hover_color=theme["dictation_on_hover"],
+            )
+        else:
+            speaker_pill.configure(
+                text="🔇" if theme["dictation_swap_icon"] else "🔊",
+                fg_color=theme["dictation_off_color"],
+                hover_color=theme["dictation_off_hover"],
+            )
+
     def _reset_close_timer(self, seconds=8):
         if self.is_pinned:
             return
@@ -143,10 +241,11 @@ class AssistantHUD:
         # of closing, so the user can click the mic pill again to re-listen.
         self.listening_active = False
         if self.is_pinned:
+            theme = self.THEMES[self.theme]
             status_pill = self.widgets.get("status_pill")
             query_label = self.widgets.get("query_label")
             if status_pill:
-                status_pill.configure(text="• Mic Off", fg_color="#333333", text_color="#AAAAAA")
+                status_pill.configure(text=f"{self._bullet()} Mic Off", fg_color=theme["idle_pill_bg"], text_color=theme["idle_pill_text"])
             if query_label:
                 query_label.configure(text="")
         else:
@@ -186,7 +285,7 @@ class AssistantHUD:
         response_label = self.widgets["response_label"]
 
         # UPDATED: Use the new status pill and image dot notation
-        self._safe_gui(status_pill.configure, text="• Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
+        self._safe_gui(status_pill.configure, text=f"{self._bullet()} Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
         if not skip_query_typing:
             self._safe_gui(query_label.configure, text="")
         self._safe_gui(response_label.configure, text="")
@@ -207,7 +306,7 @@ class AssistantHUD:
             if is_stale():
                 return
             # UPDATED: Style change for the status pill
-            status_pill.configure(text="• Listening", fg_color="#FF5F56", text_color="#FFFFFF")
+            status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
             self._reset_close_timer(10)
             self._start_listening_thread(is_first)
 
@@ -298,13 +397,13 @@ class AssistantHUD:
         listen_timeout = 6 if self.is_pinned else 5
         try:
             # UPDATED: Style change for the status pill
-            self._safe_gui(status_pill.configure, text="• Transcribing", fg_color="#FFBD2E", text_color="#000000")
+            self._safe_gui(status_pill.configure, text=f"{self._bullet()} Transcribing", fg_color="#FFBD2E", text_color="#000000")
             followup_q = self._transcribe_followup(timeout=listen_timeout)
             log_msg(f"Heard: '{followup_q}'", "INFO")
 
             if followup_q and not self.service.barge_in_triggered:
                 self._safe_gui(query_label.configure, text="")
-                self._safe_gui(status_pill.configure, text="• Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
+                self._safe_gui(status_pill.configure, text=f"{self._bullet()} Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
                 try:
                     answer = self.service.process_query_master(followup_q)
                     if not self.service.barge_in_triggered:
@@ -329,8 +428,10 @@ class AssistantHUD:
         query_label = self.widgets["query_label"]
         current_state = status_pill.cget("text")
 
-        # UPDATED: Check for 'Listening' or other active states in the pill text
-        if current_state in ["• Processing", "• Transcribing"] or pygame.mixer.music.get_busy():
+        # UPDATED: Check for 'Listening' or other active states in the pill text.
+        # Suffix-matched (not exact-matched) so it stays correct regardless of
+        # which theme's bullet character ("•" vs "●") is currently in use.
+        if current_state.endswith("Processing") or current_state.endswith("Transcribing") or pygame.mixer.music.get_busy():
             log_msg("Barge-in triggered by user button tap! Interrupting...", "WARNING")
             with self.service.state_lock:
                 self.service.barge_in_triggered = True
@@ -341,7 +442,7 @@ class AssistantHUD:
             self.active_token += 1
             if pygame.mixer.music.get_busy():
                 pygame.mixer.music.stop()
-            status_pill.configure(text="• Listening", fg_color="#FF5F56", text_color="#FFFFFF")
+            status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
             response_label.configure(text="")
             query_label.configure(text="")
             self.root.after(100, self._reset_barge_flag_and_listen)
@@ -369,7 +470,7 @@ class AssistantHUD:
         if self.service.barge_in_triggered:
             return
         status_pill = self.widgets["status_pill"]
-        status_pill.configure(text="• Listening", fg_color="#FF5F56", text_color="#FFFFFF")
+        status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
         self._reset_close_timer(10)
         self._start_listening_thread(is_first)
 
@@ -395,6 +496,7 @@ class AssistantHUD:
             self.service.barge_in_triggered = False
 
         self._build_window()
+        theme = self.THEMES[self.theme]
 
         # UPDATED: Create a single, translucent background panel for the entire UI
         # fg_color includes a hex value with alpha (e.g., #555555CC) for transparency.
@@ -402,10 +504,10 @@ class AssistantHUD:
         panel = ctk.CTkFrame(
             self.root,
             corner_radius=12,
-            fg_color="#6B6F73",
+            fg_color=theme["panel_fg"],
             bg_color=self.transparent_color,
             border_width=1,
-            border_color="#333333",
+            border_color=theme["panel_border"],
         )
         panel.pack(fill="both", expand=True, padx=12, pady=12)
 
@@ -413,9 +515,11 @@ class AssistantHUD:
         panel.bind("<ButtonPress-1>", self._start_move)
         panel.bind("<B1-Motion>", self._move_window)
 
-        # UPDATED: Header container, no separate toolbar frame, just place controls on top of the translucent panel
-        # Keep header same tint as panel to create a seamless frosted look
-        header = ctk.CTkFrame(panel, fg_color="#6B6F73")
+        # UPDATED: Header container, no separate toolbar frame, just place controls on top of the translucent panel.
+        # header_fg is intentionally its own theme value (distinct from
+        # panel_fg in theme2) so the header can read as a separate toolbar
+        # bar without needing a second nested frame.
+        header = ctk.CTkFrame(panel, fg_color=theme["header_fg"])
         header.pack(fill="x", side="top", padx=12, pady=(10, 5))
 
         # Mac Dots Frame
@@ -492,8 +596,38 @@ class AssistantHUD:
         pin_btn.bind("<Enter>", lambda e: _pin_hover_style())
         pin_btn.bind("<Leave>", lambda e: _pin_idle_style())
 
-        # Green dot remains decorative
-        ctk.CTkFrame(btn_frame, width=12, height=12, corner_radius=6, fg_color="#27C93F").pack(side="left", padx=4)
+        # UPDATED: Green dot toggles between theme1 and theme2. On hover it
+        # elongates like the other two dots, revealing a "Theme" label.
+        THEME_IDLE_WIDTH = 12
+        THEME_HOVER_WIDTH = 50
+
+        def _theme_idle_style():
+            theme_btn.configure(width=THEME_IDLE_WIDTH, text="")
+
+        def _theme_hover_style():
+            theme_btn.configure(width=THEME_HOVER_WIDTH, text="Theme", text_color="#123d1a")
+
+        def toggle_theme():
+            self.theme = "theme2" if self.theme == "theme1" else "theme1"
+            self._apply_theme()
+            # Cursor is still over the dot right after the click, so keep
+            # the elongated label in sync instead of waiting for the next hover.
+            _theme_hover_style()
+
+        theme_btn = ctk.CTkButton(
+            btn_frame,
+            text="",
+            width=THEME_IDLE_WIDTH,
+            height=12,
+            corner_radius=6,
+            fg_color="#27C93F",
+            hover_color="#20A032",
+            command=toggle_theme,
+            font=("Arial", 9, "bold"),
+        )
+        theme_btn.pack(side="left", padx=4)
+        theme_btn.bind("<Enter>", lambda e: _theme_hover_style())
+        theme_btn.bind("<Leave>", lambda e: _theme_idle_style())
 
         # Flat, subtle Opacity Slider
         opacity_slider = ctk.CTkSlider(
@@ -504,10 +638,10 @@ class AssistantHUD:
             height=10,
             command=self._change_opacity,
             border_width=0,
-            button_color="#CCCCCC",
-            button_hover_color="#FFFFFF",
-            progress_color="#ffbd44",
-            fg_color="#333333"
+            button_color=theme["slider_button"],
+            button_hover_color=theme["slider_button_hover"],
+            progress_color=theme["slider_progress"],
+            fg_color=theme["slider_track"],
         )
         opacity_slider.set(1.0)
         opacity_slider.pack(side="left", padx=(15, 5))
@@ -516,22 +650,23 @@ class AssistantHUD:
         # Style mapped to image: green pill, white speaker icon.
         def toggle_dictation():
             self.service.dictation_enabled = not self.service.dictation_enabled
+            active_theme = self.THEMES[self.theme]
             if self.service.dictation_enabled:
-                speaker_pill.configure(fg_color="#27C93F", hover_color="#20A032")
+                speaker_pill.configure(text="🔊", fg_color=active_theme["dictation_on_color"], hover_color=active_theme["dictation_on_hover"])
                 pygame.mixer.music.set_volume(1.0)
             else:
-                # Still use green for appearance, just toggle audio logic
-                speaker_pill.configure(fg_color="#ff605c", hover_color="#d04040")
+                icon = "🔇" if active_theme["dictation_swap_icon"] else "🔊"
+                speaker_pill.configure(text=icon, fg_color=active_theme["dictation_off_color"], hover_color=active_theme["dictation_off_hover"])
                 pygame.mixer.music.set_volume(0.0)
 
         # Speaker emoji "🔊" as icon, green pill style
         speaker_pill = ctk.CTkButton(
             header,
             text="🔊",
-            font=("Consolas", 14),
+            font=(theme["dictation_font"], 14),
             text_color="#FFFFFF",
-            fg_color="#27C93F" if self.service.dictation_enabled else "#ff605c",
-            hover_color="#20A032",
+            fg_color=theme["dictation_on_color"] if self.service.dictation_enabled else theme["dictation_off_color"],
+            hover_color=theme["dictation_on_hover"] if self.service.dictation_enabled else theme["dictation_off_hover"],
             corner_radius=13, # Pill shape for height 26
             width=30,
             height=26,
@@ -544,14 +679,14 @@ class AssistantHUD:
         # uses the specific dot '•' notation.
         status_pill = ctk.CTkButton(
             header,
-            text="• Mic Off",
+            text=f"{theme['bullet']} Mic Off",
             font=("Consolas", 11, "bold"),
-            text_color="#AAAAAA",
-            fg_color="#333333", # Dark background like image
+            text_color=theme["idle_pill_text"],
+            fg_color=theme["idle_pill_bg"],
             hover_color="#444444",
-            corner_radius=6,
+            corner_radius=theme["status_corner_radius"],
             width=95,
-            height=26,
+            height=theme["status_height"],
             command=self._trigger_followup_or_interrupt,
         )
         status_pill.pack(side="right", padx=(5, 10))
@@ -582,6 +717,13 @@ class AssistantHUD:
 
         # Register widgets with updated names
         self.widgets = {"status_pill": status_pill, "query_label": query_label, "response_label": response_label}
+        self.theme_widgets = {
+            "panel": panel,
+            "header": header,
+            "opacity_slider": opacity_slider,
+            "speaker_pill": speaker_pill,
+            "status_pill": status_pill,
+        }
 
         # Initialize window state and processing
         # keep the overall slight transparency for the frosted effect
