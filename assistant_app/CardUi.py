@@ -19,6 +19,7 @@ class AssistantHUD:
         self.widgets = {}
         self.active_token = 0
         self.listening_active = False
+        self.is_pinned = False
 
     def _build_window(self):
         self.root = ctk.CTk()
@@ -43,7 +44,11 @@ class AssistantHUD:
             except Exception:
                 pass
 
-    def _safe_close(self):
+    def _safe_close(self, force=False):
+        if self.is_pinned and not force:
+            log_msg("Close suppressed - widget is pinned.", "INFO")
+            return
+        self.is_pinned = False
         with self.service.state_lock:
             self.service.is_widget_open = False
             self.listening_active = False
@@ -72,6 +77,8 @@ class AssistantHUD:
         self.root.attributes("-alpha", float(value))
 
     def _reset_close_timer(self, seconds=8):
+        if self.is_pinned:
+            return
         if self.close_timer_id[0]:
             try:
                 self.root.after_cancel(self.close_timer_id[0])
@@ -84,11 +91,26 @@ class AssistantHUD:
         new_height = 135 + (lines * 22)
         self.root.geometry(f"{self.window_width}x{new_height}+{self.position['x']}+{self.position['y']}")
 
-    def _transcribe_followup(self):
+    def _transcribe_followup(self, timeout=5):
         with sr.Microphone() as source:
             self.service.recognizer.adjust_for_ambient_noise(source, duration=0.3)
-            audio_capture = self.service.recognizer.listen(source, timeout=5, phrase_time_limit=5)
+            audio_capture = self.service.recognizer.listen(source, timeout=timeout, phrase_time_limit=5)
             return self.service.transcribe_audio(audio_capture)
+
+    def _end_listening_stage(self):
+        # Ends just the listening/transcribing attempt. While pinned, the
+        # widget itself must stay open - revert to an idle mic state instead
+        # of closing, so the user can click the mic pill again to re-listen.
+        self.listening_active = False
+        if self.is_pinned:
+            status_pill = self.widgets.get("status_pill")
+            query_label = self.widgets.get("query_label")
+            if status_pill:
+                status_pill.configure(text="• Mic Off", fg_color="#333333", text_color="#AAAAAA")
+            if query_label:
+                query_label.configure(text="")
+        else:
+            self._safe_close()
 
     def _process_queue_events(self):
         while not self.service.widget_command_queue.empty():
@@ -135,7 +157,7 @@ class AssistantHUD:
         q_idx = [0]
         r_idx = [0]
         response_render_complete = [False]
-        audio_playback_complete = [not self.service.dictation_enabled]
+        audio_playback_complete = [False]
         audio_ready = [False]
         audio_started = [False]
         pending_audio_file = [None]
@@ -156,7 +178,9 @@ class AssistantHUD:
         def start_audio_playback_if_ready():
             if is_stale() or audio_started[0] or not audio_ready[0]:
                 return
-            if not pending_audio_file[0]:
+            # Checked live (not captured once at generation time) so that an
+            # unmute after the audio finished generating still plays it.
+            if not pending_audio_file[0] or not self.service.dictation_enabled:
                 audio_playback_complete[0] = True
                 finalize_response_stage()
                 return
@@ -226,10 +250,13 @@ class AssistantHUD:
     def _listen_for_followup(self, is_first=False):
         status_pill = self.widgets["status_pill"]
         query_label = self.widgets["query_label"]
+        # Pinned sessions get a slightly longer listening window since the
+        # user has explicitly signalled they intend to keep talking.
+        listen_timeout = 6 if self.is_pinned else 5
         try:
             # UPDATED: Style change for the status pill
             self._safe_gui(status_pill.configure, text="• Transcribing", fg_color="#FFBD2E", text_color="#000000")
-            followup_q = self._transcribe_followup()
+            followup_q = self._transcribe_followup(timeout=listen_timeout)
             log_msg(f"Heard: '{followup_q}'", "INFO")
 
             if followup_q and not self.service.barge_in_triggered:
@@ -247,11 +274,11 @@ class AssistantHUD:
                         )
                 except Exception as exc:
                     log_msg(f"Pipeline failure: {exc}", "ERROR")
-                    self._safe_gui(self._safe_close)
+                    self._safe_gui(self._end_listening_stage)
             else:
-                self._safe_gui(self._safe_close)
+                self._safe_gui(self._end_listening_stage)
         except Exception:
-            self._safe_gui(self._safe_close)
+            self._safe_gui(self._end_listening_stage)
 
     def _trigger_followup_or_interrupt(self):
         status_pill = self.widgets["status_pill"]
@@ -361,16 +388,60 @@ class AssistantHUD:
             corner_radius=6,
             fg_color="#FF5F56",
             hover_color="#C93F3A",
-            command=self._safe_close,
+            command=lambda: self._safe_close(force=True),
             font=("Arial", 11, "bold"),
         )
         close_btn.pack(side="left", padx=4)
         close_btn.bind("<Enter>", lambda e: close_btn.configure(text="×", text_color="#330000"))
         close_btn.bind("<Leave>", lambda e: close_btn.configure(text=""))
 
-        # Yellow and Green dots as frames
-        for color in ["#FFBD2E", "#27C93F"]:
-            ctk.CTkFrame(btn_frame, width=12, height=12, corner_radius=6, fg_color=color).pack(side="left", padx=4)
+        # UPDATED: Yellow dot doubles as a pin toggle - keeps the widget from
+        # auto-timing-out until clicked again. On hover it elongates to the
+        # right (away from the green dot) and reveals a "Pin"/"Unpin" label.
+        PIN_IDLE_WIDTH = 12
+        PIN_HOVER_WIDTH = 42
+
+        def _pin_idle_style():
+            if self.is_pinned:
+                pin_btn.configure(width=PIN_IDLE_WIDTH, text="📌", fg_color="#FFD666", hover_color="#FFD666", text_color="#402d00")
+            else:
+                pin_btn.configure(width=PIN_IDLE_WIDTH, text="", fg_color="#FFBD2E", hover_color="#E0A527")
+
+        def _pin_hover_style():
+            pin_btn.configure(width=PIN_HOVER_WIDTH, text="Unpin" if self.is_pinned else "Pin", text_color="#402d00")
+
+        def toggle_pin():
+            self.is_pinned = not self.is_pinned
+            if self.is_pinned:
+                if self.close_timer_id[0]:
+                    try:
+                        self.root.after_cancel(self.close_timer_id[0])
+                    except Exception:
+                        pass
+                    self.close_timer_id[0] = None
+            else:
+                self._reset_close_timer(10)
+            # Cursor is still over the dot right after the click, so keep the
+            # elongated label in sync instead of waiting for the next hover.
+            _pin_hover_style()
+
+        pin_btn = ctk.CTkButton(
+            btn_frame,
+            text="",
+            width=PIN_IDLE_WIDTH,
+            height=12,
+            corner_radius=6,
+            fg_color="#FFBD2E",
+            hover_color="#E0A527",
+            command=toggle_pin,
+            font=("Arial", 9, "bold"),
+        )
+        pin_btn.pack(side="left", padx=4)
+        pin_btn.bind("<Enter>", lambda e: _pin_hover_style())
+        pin_btn.bind("<Leave>", lambda e: _pin_idle_style())
+
+        # Green dot remains decorative
+        ctk.CTkFrame(btn_frame, width=12, height=12, corner_radius=6, fg_color="#27C93F").pack(side="left", padx=4)
 
         # Flat, subtle Opacity Slider
         opacity_slider = ctk.CTkSlider(
