@@ -17,6 +17,7 @@ class AppConfig:
     max_exchanges: int = 3
     groq_model: str = "llama-3.1-8b-instant"
     gemini_model: str = "gemini-2.5-flash"
+    stt_model: str = "small.en"
     wake_threshold: float = 0.5
     tts_voice: str = "en-US-GuyNeural"
     tts_rate: int = 170

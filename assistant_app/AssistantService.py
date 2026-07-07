@@ -1,6 +1,6 @@
 import asyncio
 from collections import deque
-import json
+import io
 import os
 import random
 import re
@@ -17,6 +17,7 @@ import warnings
 import concurrent.futures
 
 import edge_tts
+from faster_whisper import WhisperModel
 import nltk
 from nltk.corpus import wordnet
 from groq import Groq
@@ -65,6 +66,11 @@ class AssistantService:
         self.recognizer = sr.Recognizer()
         self.offline_tts = pyttsx3.init()
         self.offline_tts.setProperty("rate", self.config.tts_rate)
+        # CPU-friendly, int8-quantized Whisper via CTranslate2 - used as the
+        # offline STT fallback when there's no internet (replaces Vosk,
+        # which required a separately downloaded/placed model and gave much
+        # rougher accuracy).
+        self.offline_stt = WhisperModel(self.config.stt_model, device="cpu", compute_type="int8")
 
         pygame.mixer.init()
 
@@ -252,9 +258,11 @@ class AssistantService:
                 return ""
 
         try:
-            result = json.loads(self.recognizer.recognize_vosk(audio_capture))
-            return result.get("text", "").strip()
-        except Exception:
+            wav_bytes = io.BytesIO(audio_capture.get_wav_data())
+            segments, _ = self.offline_stt.transcribe(wav_bytes, language="en", vad_filter=True)
+            return " ".join(segment.text.strip() for segment in segments).strip()
+        except Exception as exc:
+            self.log(f"Offline STT failed: {exc}", "WARNING")
             return ""
 
     def capture_microphone_text(self, timeout=5, phrase_time_limit=5, ambient_noise=0.3):

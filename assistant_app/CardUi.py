@@ -52,15 +52,55 @@ class AssistantHUD:
         with self.service.state_lock:
             self.service.is_widget_open = False
             self.listening_active = False
+        # Stop any in-progress voice dictation immediately - closing the
+        # widget should silence Alexa's speech too, not just hide the UI.
+        try:
+            if pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
         log_msg("Closing Widget.", "INFO")
-        if self.root:
-            for after_id in self.root.tk.eval("after info").split():
+        root = self.root
+        # Full reset up front so the HUD instance is immediately ready for
+        # the next wake-word trigger - this only tears down this window/
+        # mainloop, it does not touch the outer wake-word listening loop
+        # in AppRuntime.
+        self.root = None
+        self.widgets = {}
+        self.close_timer_id = [None]
+        if root:
+            # Hide the window immediately and synchronously - withdraw()
+            # issues a direct OS-level hide rather than relying on Tk's
+            # event loop, so the widget visually disappears right away
+            # instead of leaving a "ghost" frame on screen once mainloop
+            # stops pumping events (a known quirk with overrideredirect +
+            # topmost + color-key transparent windows on Windows).
+            try:
+                root.withdraw()
+            except Exception:
+                pass
+
+            def _teardown():
+                for after_id in root.tk.eval("after info").split():
+                    try:
+                        root.after_cancel(after_id)
+                    except Exception:
+                        pass
                 try:
-                    self.root.after_cancel(after_id)
+                    root.quit()
+                    root.destroy()
                 except Exception:
                     pass
-            self.root.quit()
-            self.root.destroy()
+
+            # Deferred by one tick: this is invoked as the close button's
+            # own Tcl command callback, and destroying a widget tree
+            # synchronously from inside its own callback raises
+            # "can't delete Tcl command". Scheduling it via `after` runs
+            # the teardown once that callback frame has fully returned -
+            # the same safe context the natural auto-timeout close already
+            # uses (it fires from a plain `after` callback, never a
+            # button's own click handler).
+            root.after(1, _teardown)
 
     def _start_move(self, event):
         self.position["drag_x"] = event.x
@@ -203,7 +243,6 @@ class AssistantHUD:
                 return
             if self.service.dictation_enabled:
                 response_label.configure(text="Thinking...█")
-                self.service.generate_audio(a_str, on_audio_ready)
             type_response()
 
         def on_audio_ready(filepath):
@@ -232,15 +271,19 @@ class AssistantHUD:
                 response_label.configure(text=a_str)
                 response_render_complete[0] = True
                 if not is_stale():
-                    if not self.service.dictation_enabled:
-                        self.root.after(500, finalize_response_stage)
-                    else:
-                        start_audio_playback_if_ready()
+                    start_audio_playback_if_ready()
 
         def audio_finished_callback():
             if not is_stale():
                 audio_playback_complete[0] = True
                 self._safe_gui(finalize_response_stage)
+
+        # Kick off TTS generation immediately, in parallel with whatever
+        # typing animation runs next, instead of waiting for the query text
+        # to finish typing first - minimizes the delay between the answer
+        # existing and its audio being ready. Always generated (even while
+        # muted) so a later unmute still has something to play back.
+        self.service.generate_audio(a_str, on_audio_ready)
 
         if skip_query_typing:
             start_response_phase()
@@ -379,21 +422,30 @@ class AssistantHUD:
         btn_frame = ctk.CTkFrame(header, fg_color="transparent")
         btn_frame.pack(side="left", padx=(2, 10))
 
-        # UPDATED: Stylized dots. Red dot with '×' on hover
+        # UPDATED: Stylized dots. Red dot elongates to a "Close" label on hover.
+        CLOSE_IDLE_WIDTH = 12
+        CLOSE_HOVER_WIDTH = 46
+
+        def _close_idle_style():
+            close_btn.configure(width=CLOSE_IDLE_WIDTH, text="")
+
+        def _close_hover_style():
+            close_btn.configure(width=CLOSE_HOVER_WIDTH, text="Close", text_color="#330000")
+
         close_btn = ctk.CTkButton(
             btn_frame,
             text="",
-            width=12,
+            width=CLOSE_IDLE_WIDTH,
             height=12,
             corner_radius=6,
             fg_color="#FF5F56",
             hover_color="#C93F3A",
             command=lambda: self._safe_close(force=True),
-            font=("Arial", 11, "bold"),
+            font=("Arial", 9, "bold"),
         )
         close_btn.pack(side="left", padx=4)
-        close_btn.bind("<Enter>", lambda e: close_btn.configure(text="×", text_color="#330000"))
-        close_btn.bind("<Leave>", lambda e: close_btn.configure(text=""))
+        close_btn.bind("<Enter>", lambda e: _close_hover_style())
+        close_btn.bind("<Leave>", lambda e: _close_idle_style())
 
         # UPDATED: Yellow dot doubles as a pin toggle - keeps the widget from
         # auto-timing-out until clicked again. On hover it elongates to the
