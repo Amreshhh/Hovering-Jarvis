@@ -15,8 +15,8 @@ The project is split into small modules so the UI, runtime loop, configuration, 
 
 ## Features
 
-- Wake-word activation for hands-free use.
-- Floating Alexa with query, response, and status display.
+- (Custom) Wake-word activation for hands-free use.
+- Floating Alexa with query, response, and status display and auto-timeout.
 - Follow-up listening after a response completes.
 - Barge-in support to interrupt active speech or processing.
 - Text-to-speech output with audio playback cleanup.
@@ -30,6 +30,12 @@ The interface includes two visual themes and can be used as a wonderful overlayi
 | Theme 1 | Theme 2 |
 | --- | --- |
 | ![Theme 1](screenshots/Screenshot%202026-07-06%20213700.png) | ![Theme 2](screenshots/Screenshot%202026-07-06%20224955.png) |
+
+### Overlay View
+
+This screenshot shows the Alexa working as an overlaying dictionary on top of another app.
+
+![Overlay View](screenshots/image-1783412570836.png)
 
 ## Alexa Controls
 

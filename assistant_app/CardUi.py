@@ -61,6 +61,14 @@ class AssistantAlexa:
         self.root = None
         self.window_width = 440
         self.window_height = 130
+        self.min_window_width = 440
+        self.min_window_height = 130
+        # Floor the auto-grow height logic can't shrink below - stays at the
+        # built-in minimum until the user drags the resize grip, at which
+        # point it sticks to whatever size they chose (persists across
+        # queries and reopens, same as the theme/pinned state below).
+        self.height_floor = self.min_window_height
+        self._resize_drag = None
         self.transparent_color = "#000001"
         self.position = None
         self.close_timer_id = [None]
@@ -181,6 +189,39 @@ class AssistantAlexa:
     def _move_window(self, event):
         self.set_position(event.x_root - self.position["drag_x"], event.y_root - self.position["drag_y"])
 
+    def _start_resize(self, event):
+        self._resize_drag = {
+            "x": event.x_root,
+            "y": event.y_root,
+            "w": self.window_width,
+            "h": self.window_height,
+        }
+
+    def _do_resize(self, event):
+        if not self._resize_drag or not self.root or not self.root.winfo_exists():
+            return
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        max_width = max(self.min_window_width, screen_width - self.position["x"])
+        max_height = max(self.min_window_height, screen_height - self.position["y"])
+
+        dx = event.x_root - self._resize_drag["x"]
+        dy = event.y_root - self._resize_drag["y"]
+        self.window_width = int(max(self.min_window_width, min(self._resize_drag["w"] + dx, max_width)))
+        self.window_height = int(max(self.min_window_height, min(self._resize_drag["h"] + dy, max_height)))
+        # A manual drag sets a new sticky floor so the next auto-grow/shrink
+        # pass (triggered by typing out a response) never snaps the widget
+        # back below the size the user just chose.
+        self.height_floor = self.window_height
+
+        self._apply_geometry()
+        self._update_wrap_length()
+
+    def _update_wrap_length(self):
+        response_label = self.widgets.get("response_label")
+        if response_label:
+            response_label.configure(wraplength=max(120, self.window_width - 70))
+
     def _change_opacity(self, value):
         self.root.attributes("-alpha", float(value))
 
@@ -244,8 +285,13 @@ class AssistantAlexa:
         self.close_timer_id[0] = self.root.after(seconds * 1000, self._safe_close)
 
     def _update_height(self, text_len):
-        lines = (text_len // 50) + 1
-        self.window_height = 135 + (lines * 22)
+        # Estimate chars-per-line from the current (possibly user-resized)
+        # width instead of a fixed 50, so a widened widget wraps into fewer,
+        # longer lines and doesn't grow taller than it needs to.
+        chars_per_line = max(20, (self.window_width - 90) // 7)
+        lines = (text_len // chars_per_line) + 1
+        computed = 135 + (lines * 22)
+        self.window_height = max(computed, self.height_floor)
         self._apply_geometry()
 
     def _transcribe_followup(self, timeout=5):
@@ -733,10 +779,30 @@ class AssistantAlexa:
         query_label.pack(side="left")
 
         # Response label (typing area)
-        response_label = ctk.CTkLabel(body, text="", font=("Consolas", 13), text_color="#CCCCCC", justify="left", wraplength=370)
+        response_label = ctk.CTkLabel(
+            body, text="", font=("Consolas", 13), text_color="#CCCCCC", justify="left", wraplength=max(120, self.window_width - 70)
+        )
         response_label.pack(anchor="w", pady=(10, 0))
         response_label.bind("<ButtonPress-1>", self._start_move)
         response_label.bind("<B1-Motion>", self._move_window)
+
+        # Resize grip - bottom-right corner handle the user can drag to
+        # widen/lengthen the widget. Placed last so it stacks visually above
+        # the packed panel/body content, overlaid via place() rather than
+        # pack() so it doesn't consume layout space.
+        resize_grip = ctk.CTkLabel(
+            panel,
+            text="⇲",
+            font=("Arial", 13, "bold"),
+            text_color="#AAAAAA",
+            fg_color="transparent",
+            cursor="size_nw_se",
+            width=16,
+            height=16,
+        )
+        resize_grip.place(relx=1.0, rely=1.0, x=-3, y=-3, anchor="se")
+        resize_grip.bind("<ButtonPress-1>", self._start_resize)
+        resize_grip.bind("<B1-Motion>", self._do_resize)
 
         # Register widgets with updated names
         self.widgets = {"status_pill": status_pill, "query_label": query_label, "response_label": response_label}
