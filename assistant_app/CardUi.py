@@ -7,7 +7,7 @@ import speech_recognition as sr
 from .Logger import log_msg
 
 
-class AssistantHUD:
+class AssistantAlexa:
     # theme1 is the original look; theme2 is a darker, more minimal "toolbar"
     # look (separate-toned header bar, muted grayscale controls). Both share
     # the exact same widget structure - only colors/fonts/labels differ - so
@@ -110,7 +110,7 @@ class AssistantHUD:
             pass
         log_msg("Closing Widget.", "INFO")
         root = self.root
-        # Full reset up front so the HUD instance is immediately ready for
+        # Full reset up front so the Alexa instance is immediately ready for
         # the next wake-word trigger - this only tears down this window/
         # mainloop, it does not touch the outer wake-word listening loop
         # in AppRuntime.

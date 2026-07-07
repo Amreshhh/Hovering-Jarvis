@@ -6,7 +6,7 @@ import numpy as np
 from .AppConfig import ConfigError, load_config
 from .Logger import log_msg
 from .AssistantService import AssistantService
-from .CardUi import AssistantHUD
+from .CardUi import AssistantAlexa
 
 
 def main():
@@ -17,7 +17,7 @@ def main():
         return
 
     service = AssistantService(config)
-    hud = AssistantHUD(service)
+    Alexa = AssistantAlexa(service)
 
     log_msg(
         f"Agent initialized successfully. Tracking profile: '{config.user_name}' | Wake: '{service.active_wake_word}'",
@@ -40,8 +40,8 @@ def main():
                         service.mic_stream.stop_stream()
                         service.wake_model.reset()
 
-                        threading.Thread(target=hud.capture_initial_query, daemon=True).start()
-                        hud.display_response()
+                        threading.Thread(target=Alexa.capture_initial_query, daemon=True).start()
+                        Alexa.display_response()
                         time.sleep(1)
                 else:
                     time.sleep(0.5)
