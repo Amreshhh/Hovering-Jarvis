@@ -93,9 +93,23 @@ USER_NAME=User
 WAKE_WORD=alexa
 GROQ_API_KEY_2=optional_additional_key
 GEMINI_API_KEY_2=optional_additional_key
+
+GREET_USER=true
+SYSTEM_INSTRUCTION="You are a fast, minimalist assistant. Explain using layman's terms and avoid bombastic definitions. When defining words, include one example sentence. Answer in 1 or 2 sentences."
+UNPIN_TIMEOUT_SECONDS=5
+INITIAL_THEME=light
+ALWAYS_MUTE=false
 ```
 
-`GROQ_API_KEY_1` and `GEMINI_API_KEY_1` are mandatory. The app will not start without them.
+`GROQ_API_KEY_1` and `GEMINI_API_KEY_1` are mandatory. The app will not start without them. Only `alexa` and `jarvis` are supported as the wake word for now.
+
+Here's what the optional ones do:
+
+- `GREET_USER`: if `true`, every response starts with "Hey `<USER_NAME>`, ...". If `false`, it just answers directly.
+- `SYSTEM_INSTRUCTION`: the preset instruction sent to the API on every call. Change this to change how Alexa answers.
+- `UNPIN_TIMEOUT_SECONDS`: how many seconds the widget stays open after being unpinned (or if it was never pinned) before it auto-closes.
+- `INITIAL_THEME`: `light` or `dark` - the theme the widget opens with. This gets rewritten automatically whenever you switch themes in the widget, so it remembers the last one you used.
+- `ALWAYS_MUTE`: if `true`, Alexa starts muted every time the widget opens (you can still unmute it from the widget). If `false`, it works as usual.
 
 ## Run
 

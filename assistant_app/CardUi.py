@@ -5,6 +5,7 @@ import customtkinter as ctk
 import pygame
 import speech_recognition as sr
 
+from .AppConfig import save_theme_preference
 from .Logger import log_msg
 
 # GetSystemMetrics indices for the full virtual desktop (spans every
@@ -99,7 +100,7 @@ class AssistantAlexa:
         # Each entry: {"prompt_frame", "query_label", "response_label", "copy_btn"}.
         self.history_blocks = []
         self.max_history_blocks = 3
-        self.theme = "theme1"
+        self.theme = self.config.initial_theme
         self.active_token = 0
         self.listening_active = False
         self.is_pinned = False
@@ -459,9 +460,11 @@ class AssistantAlexa:
         block["prompt_frame"].destroy()
         block["response_label"].destroy()
 
-    def _reset_close_timer(self, seconds=5):
+    def _reset_close_timer(self, seconds=None):
         if self.is_pinned:
             return
+        if seconds is None:
+            seconds = self.config.unpin_timeout_seconds
         if self.close_timer_id[0]:
             try:
                 self.root.after_cancel(self.close_timer_id[0])
@@ -545,7 +548,7 @@ class AssistantAlexa:
         # UPDATED: Use the new status pill and image dot notation
         self._safe_gui(status_pill.configure, text=f"{self._bullet()} Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
 
-        if not is_followup:
+        if not is_followup and self.config.greet_user:
             a_str = f"Hey {self.config.user_name}, {a_str}"
 
         q_idx = [0]
@@ -562,7 +565,7 @@ class AssistantAlexa:
                 return
             # UPDATED: Style change for the status pill
             status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
-            self._reset_close_timer(5)
+            self._reset_close_timer()
             self._start_listening_thread(is_first)
 
         def finalize_response_stage():
@@ -702,13 +705,13 @@ class AssistantAlexa:
             self._discard_current_block()
             self.root.after(100, self._reset_barge_flag_and_listen)
         else:
-            self._reset_close_timer(5)
+            self._reset_close_timer()
             self._activate_listening_ui(is_first=False)
 
     def _reset_barge_flag_and_listen(self):
         with self.service.state_lock:
             self.service.barge_in_triggered = False
-        self._reset_close_timer(5)
+        self._reset_close_timer()
         self.listening_active = False
         self._start_listening_thread(False)
 
@@ -726,7 +729,7 @@ class AssistantAlexa:
             return
         status_pill = self.widgets["status_pill"]
         status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
-        self._reset_close_timer(5)
+        self._reset_close_timer()
         self._start_listening_thread(is_first)
 
     def capture_initial_query(self):
@@ -831,7 +834,7 @@ class AssistantAlexa:
                         pass
                     self.close_timer_id[0] = None
             else:
-                self._reset_close_timer(5)
+                self._reset_close_timer()
             # Cursor is still over the dot right after the click, so keep the
             # elongated label in sync instead of waiting for the next hover.
             _pin_hover_style()
@@ -865,6 +868,10 @@ class AssistantAlexa:
         def toggle_theme():
             self.theme = "theme2" if self.theme == "theme1" else "theme1"
             self._apply_theme()
+            # Remembers the choice in .env (INITIAL_THEME) so the widget
+            # reopens with whichever theme was used last, not always the
+            # one baked into the .env default.
+            save_theme_preference(self.theme)
             # Cursor is still over the dot right after the click, so keep
             # the elongated label in sync instead of waiting for the next hover.
             _theme_hover_style()
@@ -969,7 +976,7 @@ class AssistantAlexa:
                 self.service.stop_meeting_mode()
                 self.is_pinned = self._meeting_prev_pinned
                 if not self.is_pinned:
-                    self._reset_close_timer(5)
+                    self._reset_close_timer()
                 self.service.dictation_enabled = self._meeting_prev_dictation
                 pygame.mixer.music.set_volume(1.0 if self.service.dictation_enabled else 0.0)
             else:

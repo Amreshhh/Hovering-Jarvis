@@ -116,7 +116,7 @@ class AssistantService:
         self.state_lock = threading.Lock()
         self.query_lock = threading.Lock()
         self.is_widget_open = False
-        self.dictation_enabled = True
+        self.dictation_enabled = not config.always_mute
         self.barge_in_triggered = False
         self.meeting_mode_enabled = False
         self.meeting_listener_thread = None
@@ -251,7 +251,7 @@ class AssistantService:
 
     def get_groq_response(self, client, user_text, timeout_val):
         messages = [
-            {"role": "system", "content": "You are a fast, minimalist assistant. Explain using layman's terms and avoid bombastic definitions. When defining words, include one example sentence. Answer in 1 or 2 sentences."}
+            {"role": "system", "content": self.config.system_instruction}
         ] + self._history_messages_for_groq() + [{"role": "user", "content": user_text}]
         response = client.chat.completions.create(messages=messages, model=self.config.groq_model, timeout=timeout_val)
         answer = (response.choices[0].message.content or "").strip()
@@ -264,7 +264,7 @@ class AssistantService:
         history = self._history_messages_for_gemini()
         history.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
         config = types.GenerateContentConfig(
-            system_instruction="You are a fast, minimalist assistant. Explain using layman's terms and avoid bombastic definitions. When defining words, include one example sentence. Answer in 1 or 2 sentences.",
+            system_instruction=self.config.system_instruction,
             http_options=types.HttpOptions(timeout=int(timeout_val * 1000)),
         )
         response = client.models.generate_content(model=self.config.gemini_model, contents=history, config=config)
