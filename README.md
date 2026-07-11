@@ -23,6 +23,9 @@ The project is split into small modules so the UI, runtime loop, configuration, 
 - Online response routing with fallback behavior for simple definition-style queries.
 - Alexa controls for theme switching, pinning, closing, opacity adjustment, and audio mute/unmute.
 - Meeting mode: listens to the PC's own system/loopback audio (e.g. a Zoom or Teams call) instead of the microphone, transcribes what's said, and types the answer in the widget - handy for getting live answers to questions asked in a meeting.
+- Chat history: the last 3 questions and answers stay on screen in a scrollable list, so you don't lose the earlier ones when you ask something new.
+- Copy buttons: grab a single answer or the whole visible conversation with one click.
+- A small drag handle above the toolbar for moving the window around.
 
 ## Two Themes
 
@@ -40,15 +43,31 @@ This screenshot shows the Alexa working as an overlaying dictionary on top of an
 
 ## Alexa Controls
 
-The floating Alexa uses color-coded controls so the interaction stays simple:
+The floating Alexa is split into three areas: a drag handle on top, a toolbar with all the buttons, and the response area below it.
 
-- 🟢 Green button: toggles between the available themes.
+### Drag handle
+
+A small bar sits right above the toolbar, centered. It's just there to grab and move the window - nothing else. It's red on Theme 1 and green on Theme 2, so it's always easy to spot against either background.
+
+### Toolbar
+
+Left to right, this is what's in the toolbar:
+
+- 🟢 Green button: switches between the two themes.
 - 🟡 Yellow button: pins or unpins the Alexa so it stays open.
 - 🔴 Red button: closes the window.
-- Status pill: click while the assistant is processing or transcribing to barge in and interrupt the current response.
-- Opacity slider: adjusts the transparency of the Alexa window.
+- Opacity slider: adjusts how see-through the window is.
+- 📋 Copy-all button: copies the whole visible conversation (up to the last 3 questions and answers) to the clipboard in one click.
 - 🖥 Meeting-mode button: toggles listening to the PC's system audio (loopback) instead of the mic. While active, the Alexa is auto-pinned open and its own TTS is muted, so it just types out answers to whatever it hears in the call. Requires Windows with a WASAPI loopback device (`PyAudioWPatch`); the button is greyed out if unavailable.
 - Speaker button: mutes or unmutes assistant audio playback.
+- Status pill: shows what the assistant is doing right now (Mic Off, Listening, Transcribing, Processing). Click it while the assistant is processing or transcribing to barge in and interrupt the current response.
+
+### Response area
+
+- Keeps the last 3 questions and their answers on screen instead of wiping out the previous one - just scroll up to see what was asked before.
+- A scrollbar shows up when the conversation gets longer than the window, styled to match whichever theme is active.
+- ⧉ Copy button: each answer has its own small copy button next to its question, so you can grab just that one answer.
+- You can also right-click an answer, or press Ctrl+C, to copy the most recent one.
 
 ## Setup
 

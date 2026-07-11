@@ -1,3 +1,4 @@
+import ctypes
 import threading
 
 import customtkinter as ctk
@@ -5,6 +6,14 @@ import pygame
 import speech_recognition as sr
 
 from .Logger import log_msg
+
+# GetSystemMetrics indices for the full virtual desktop (spans every
+# connected monitor, not just the primary one). Coordinates can be negative
+# for monitors placed to the left of or above the primary display.
+_SM_XVIRTUALSCREEN = 76
+_SM_YVIRTUALSCREEN = 77
+_SM_CXVIRTUALSCREEN = 78
+_SM_CYVIRTUALSCREEN = 79
 
 
 class AssistantAlexa:
@@ -32,6 +41,10 @@ class AssistantAlexa:
             "dictation_on_hover": "#20A032",
             "dictation_off_color": "#ff605c",
             "dictation_off_hover": "#d04040",
+            # theme1 reads as the "light" toolbar look, so the drag handle
+            # uses red to stay visible against its lighter panel.
+            "drag_handle_color": "#FF3B30",
+            "drag_handle_hover": "#D9342B",
         },
         "theme2": {
             "bullet": "●",
@@ -52,6 +65,9 @@ class AssistantAlexa:
             "dictation_on_hover": "#006400",
             "dictation_off_color": "#FF0000",
             "dictation_off_hover": "#CC0000",
+            # theme2 is the "dark" toolbar look - green drag handle.
+            "drag_handle_color": "#27C93F",
+            "drag_handle_hover": "#20A032",
         },
     }
 
@@ -68,12 +84,21 @@ class AssistantAlexa:
         # point it sticks to whatever size they chose (persists across
         # queries and reopens, same as the theme/pinned state below).
         self.height_floor = self.min_window_height
+        # Ceiling the auto-grow logic won't cross on its own - past this, the
+        # response body scrolls internally instead of the window ballooning
+        # down the screen. A manual resize-grip drag can still go higher.
+        self.max_auto_height = 420
         self._resize_drag = None
         self.transparent_color = "#000001"
         self.position = None
         self.close_timer_id = [None]
         self.widgets = {}
         self.theme_widgets = {}
+        # Up to the last 3 question/answer exchanges, kept visible in the
+        # scrollable body instead of each new answer replacing the last.
+        # Each entry: {"prompt_frame", "query_label", "response_label", "copy_btn"}.
+        self.history_blocks = []
+        self.max_history_blocks = 3
         self.theme = "theme1"
         self.active_token = 0
         self.listening_active = False
@@ -102,18 +127,34 @@ class AssistantAlexa:
             return
         self.root.geometry(f"{self.window_width}x{self.window_height}+{self.position['x']}+{self.position['y']}")
 
+    def _virtual_screen_bounds(self):
+        # Spans every connected monitor rather than just the primary one, so
+        # dragging isn't clamped back onto a single display. Falls back to
+        # the primary screen's own size if the Win32 call is unavailable.
+        try:
+            user32 = ctypes.windll.user32
+            x = user32.GetSystemMetrics(_SM_XVIRTUALSCREEN)
+            y = user32.GetSystemMetrics(_SM_YVIRTUALSCREEN)
+            width = user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN)
+            height = user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN)
+            if width > 0 and height > 0:
+                return x, y, width, height
+        except Exception:
+            pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
     def set_position(self, x, y):
         if self.position is None:
             self.position = {"x": int(x), "y": int(y), "drag_x": 0, "drag_y": 0}
             return
 
         if self.root and self.root.winfo_exists():
-            screen_width = self.root.winfo_screenwidth()
-            screen_height = self.root.winfo_screenheight()
-            max_x = max(0, screen_width - self.window_width)
-            max_y = max(0, screen_height - self.window_height)
-            self.position["x"] = max(0, min(int(x), max_x))
-            self.position["y"] = max(0, min(int(y), max_y))
+            vx, vy, vwidth, vheight = self._virtual_screen_bounds()
+            min_x, min_y = vx, vy
+            max_x = max(min_x, vx + vwidth - self.window_width)
+            max_y = max(min_y, vy + vheight - self.window_height)
+            self.position["x"] = max(min_x, min(int(x), max_x))
+            self.position["y"] = max(min_y, min(int(y), max_y))
             self._apply_geometry()
         else:
             self.position["x"] = int(x)
@@ -151,6 +192,7 @@ class AssistantAlexa:
         # in AppRuntime.
         self.root = None
         self.widgets = {}
+        self.history_blocks = []
         self.close_timer_id = [None]
         if root:
             # Hide the window immediately and synchronously - withdraw()
@@ -204,10 +246,9 @@ class AssistantAlexa:
     def _do_resize(self, event):
         if not self._resize_drag or not self.root or not self.root.winfo_exists():
             return
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        max_width = max(self.min_window_width, screen_width - self.position["x"])
-        max_height = max(self.min_window_height, screen_height - self.position["y"])
+        vx, vy, vwidth, vheight = self._virtual_screen_bounds()
+        max_width = max(self.min_window_width, vx + vwidth - self.position["x"])
+        max_height = max(self.min_window_height, vy + vheight - self.position["y"])
 
         dx = event.x_root - self._resize_drag["x"]
         dy = event.y_root - self._resize_drag["y"]
@@ -222,12 +263,61 @@ class AssistantAlexa:
         self._update_wrap_length()
 
     def _update_wrap_length(self):
-        response_label = self.widgets.get("response_label")
-        if response_label:
-            response_label.configure(wraplength=max(120, self.window_width - 70))
+        wrap = max(120, self.window_width - 70)
+        for block in self.history_blocks:
+            block["response_label"].configure(wraplength=wrap)
 
     def _change_opacity(self, value):
         self.root.attributes("-alpha", float(value))
+
+    def _flash_widget_color(self, widget, attr="text_color", color="#27C93F", delay=350):
+        # Purely a color flash for feedback - never touches label *text*,
+        # since the typewriter animation keeps rewriting response text on
+        # its own schedule and a swapped-then-restored string could race it.
+        if not widget:
+            return
+        original = widget.cget(attr)
+        widget.configure(**{attr: color})
+        self.root.after(delay, lambda: widget.winfo_exists() and widget.configure(**{attr: original}))
+
+    def _copy_text_from_label(self, label):
+        # Right-click (or Ctrl+C for the current/latest response) copies the
+        # text as-is - CTkLabel text isn't natively selectable, so this is
+        # the only way to grab it.
+        if not label:
+            return
+        content = label.cget("text").rstrip("█").strip()
+        if not content:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+        except Exception:
+            return
+        self._flash_widget_color(label)
+
+    def _copy_response_text(self, event=None):
+        self._copy_text_from_label(self.widgets.get("response_label"))
+
+    def _copy_all_history(self):
+        # Copies all currently visible Q&A blocks (up to the last 3), not
+        # just the latest one - the header's "copy everything" action.
+        parts = []
+        for block in self.history_blocks:
+            q = block["query_label"].cget("text").rstrip("█").strip()
+            a = block["response_label"].cget("text").rstrip("█").strip()
+            if not q and not a:
+                continue
+            parts.append(f"{self.config.user_name}: {q}\n{a}")
+        content = "\n\n".join(parts)
+        if not content:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+        except Exception:
+            return
+        self._flash_widget_color(self.widgets.get("copy_all_btn"))
 
     def _bullet(self):
         return self.THEMES[self.theme]["bullet"]
@@ -250,6 +340,16 @@ class AssistantAlexa:
             progress_color=theme["slider_progress"],
             fg_color=theme["slider_track"],
         )
+        w["body"].configure(
+            fg_color=theme["panel_fg"],
+            scrollbar_fg_color=theme["slider_track"],
+            scrollbar_button_color=theme["slider_button"],
+            scrollbar_button_hover_color=theme["slider_button_hover"],
+        )
+        w["drag_handle"].configure(fg_color=theme["drag_handle_color"])
+        w["copy_all_btn"].configure(fg_color=theme["idle_pill_bg"], hover_color=theme["slider_track"], text_color=theme["idle_pill_text"])
+        for block in self.history_blocks:
+            block["copy_btn"].configure(hover_color=theme["idle_pill_bg"], text_color=theme["idle_pill_text"])
 
         status_pill = w["status_pill"]
         status_pill.configure(corner_radius=theme["status_corner_radius"], height=theme["status_height"])
@@ -287,7 +387,79 @@ class AssistantAlexa:
         else:
             meeting_pill.configure(fg_color=theme["idle_pill_bg"], hover_color="#444444", text_color="#FFFFFF")
 
-    def _reset_close_timer(self, seconds=8):
+    def _create_qa_block(self):
+        # Appends a fresh, blank query/response row to the scrollable
+        # history instead of reusing a single pair of labels - this is what
+        # lets the last few exchanges stay visible instead of each new
+        # answer replacing the last. Oldest block is evicted once the cap
+        # is exceeded. Returns (query_label, response_label) for the new
+        # block and also registers them as the "current" ones in
+        # self.widgets, since most of the sequencing code just wants
+        # whatever the latest block is.
+        body = self.widgets["body"]
+        theme = self.THEMES[self.theme]
+
+        prompt_frame = ctk.CTkFrame(body, fg_color="transparent")
+        prompt_frame.pack(fill="x", anchor="w", pady=(10, 0) if self.history_blocks else (0, 0))
+        prompt_frame.bind("<ButtonPress-1>", self._start_move)
+        prompt_frame.bind("<B1-Motion>", self._move_window)
+
+        ctk.CTkLabel(prompt_frame, text=f"{self.config.user_name}:", font=("Consolas", 13, "bold"), text_color="#00FF9C").pack(side="left")
+        ctk.CTkLabel(prompt_frame, text="~", font=("Consolas", 13, "bold"), text_color="#0066FF").pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(prompt_frame, text="$", font=("Consolas", 13, "bold"), text_color="#FF00FF").pack(side="left", padx=(6, 10))
+
+        query_label = ctk.CTkLabel(prompt_frame, text="", font=("Consolas", 13), text_color="#FFFFFF")
+        query_label.pack(side="left")
+
+        response_label = ctk.CTkLabel(
+            body, text="", font=("Consolas", 13), text_color="#CCCCCC", justify="left", wraplength=max(120, self.window_width - 70)
+        )
+        response_label.pack(anchor="w", pady=(10, 0))
+        response_label.bind("<ButtonPress-1>", self._start_move)
+        response_label.bind("<B1-Motion>", self._move_window)
+        response_label.bind("<Button-3>", lambda e, lbl=response_label: self._copy_text_from_label(lbl))
+
+        # Small copy icon for this specific response, right-aligned on its
+        # own query line - distinct from the header's "copy everything".
+        copy_btn = ctk.CTkButton(
+            prompt_frame,
+            text="⧉",
+            width=22,
+            height=18,
+            corner_radius=4,
+            font=("Consolas", 11),
+            fg_color="transparent",
+            hover_color=theme["idle_pill_bg"],
+            text_color=theme["idle_pill_text"],
+            command=lambda lbl=response_label: self._copy_text_from_label(lbl),
+        )
+        copy_btn.pack(side="right", padx=(4, 0))
+
+        block = {"prompt_frame": prompt_frame, "query_label": query_label, "response_label": response_label, "copy_btn": copy_btn}
+        self.history_blocks.append(block)
+        if len(self.history_blocks) > self.max_history_blocks:
+            oldest = self.history_blocks.pop(0)
+            oldest["prompt_frame"].destroy()
+            oldest["response_label"].destroy()
+
+        self.widgets["query_label"] = query_label
+        self.widgets["response_label"] = response_label
+
+        body.update_idletasks()
+        body._parent_canvas.yview_moveto(1.0)
+        return query_label, response_label
+
+    def _discard_current_block(self):
+        # Drops the latest (in-progress) block entirely rather than leaving
+        # a blank/partial entry in the history - used when a barge-in
+        # interrupts a response before it ever finished.
+        if not self.history_blocks:
+            return
+        block = self.history_blocks.pop()
+        block["prompt_frame"].destroy()
+        block["response_label"].destroy()
+
+    def _reset_close_timer(self, seconds=5):
         if self.is_pinned:
             return
         if self.close_timer_id[0]:
@@ -303,9 +475,16 @@ class AssistantAlexa:
         # longer lines and doesn't grow taller than it needs to.
         chars_per_line = max(20, (self.window_width - 90) // 7)
         lines = (text_len // chars_per_line) + 1
-        computed = 135 + (lines * 22)
+        computed = min(135 + (lines * 22), self.max_auto_height)
         self.window_height = max(computed, self.height_floor)
         self._apply_geometry()
+        # Keep the actively-typing response in view as it grows past the
+        # visible area, instead of leaving the scroll position wherever it
+        # happened to be when this block was first created.
+        body = self.widgets.get("body")
+        if body:
+            body.update_idletasks()
+            body._parent_canvas.yview_moveto(1.0)
 
     def _transcribe_followup(self, timeout=5):
         with sr.Microphone() as source:
@@ -317,15 +496,14 @@ class AssistantAlexa:
         # Ends just the listening/transcribing attempt. While pinned, the
         # widget itself must stay open - revert to an idle mic state instead
         # of closing, so the user can click the mic pill again to re-listen.
+        # Nothing was heard, so no new history block was ever created here -
+        # the last completed exchange stays exactly as it is.
         self.listening_active = False
         if self.is_pinned:
             theme = self.THEMES[self.theme]
             status_pill = self.widgets.get("status_pill")
-            query_label = self.widgets.get("query_label")
             if status_pill:
                 status_pill.configure(text=f"{self._bullet()} Mic Off", fg_color=theme["idle_pill_bg"], text_color=theme["idle_pill_text"])
-            if query_label:
-                query_label.configure(text="")
         else:
             self._safe_close()
 
@@ -359,14 +537,13 @@ class AssistantAlexa:
             return token != self.active_token or self.service.barge_in_triggered
 
         status_pill = self.widgets["status_pill"]
-        query_label = self.widgets["query_label"]
-        response_label = self.widgets["response_label"]
+        # A fresh, blank row appended to the scrollable history rather than
+        # reusing the previous turn's labels - keeps the last few exchanges
+        # visible instead of each new answer overwriting the last.
+        query_label, response_label = self._create_qa_block()
 
         # UPDATED: Use the new status pill and image dot notation
         self._safe_gui(status_pill.configure, text=f"{self._bullet()} Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
-        if not skip_query_typing:
-            self._safe_gui(query_label.configure, text="")
-        self._safe_gui(response_label.configure, text="")
 
         if not is_followup:
             a_str = f"Hey {self.config.user_name}, {a_str}"
@@ -385,7 +562,7 @@ class AssistantAlexa:
                 return
             # UPDATED: Style change for the status pill
             status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
-            self._reset_close_timer(10)
+            self._reset_close_timer(5)
             self._start_listening_thread(is_first)
 
         def finalize_response_stage():
@@ -469,7 +646,6 @@ class AssistantAlexa:
 
     def _listen_for_followup(self, is_first=False):
         status_pill = self.widgets["status_pill"]
-        query_label = self.widgets["query_label"]
         # Pinned sessions get a slightly longer listening window since the
         # user has explicitly signalled they intend to keep talking.
         listen_timeout = 6 if self.is_pinned else 5
@@ -480,7 +656,9 @@ class AssistantAlexa:
             log_msg(f"Heard: '{followup_q}'", "INFO")
 
             if followup_q and not self.service.barge_in_triggered:
-                self._safe_gui(query_label.configure, text="")
+                # The new query/answer gets its own block via _run_sequence
+                # below - nothing to clear on the previous (still valid,
+                # still-displayed) history entry here.
                 self._safe_gui(status_pill.configure, text=f"{self._bullet()} Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
                 try:
                     answer = self.service.process_query_master(followup_q)
@@ -502,8 +680,6 @@ class AssistantAlexa:
 
     def _trigger_followup_or_interrupt(self):
         status_pill = self.widgets["status_pill"]
-        response_label = self.widgets["response_label"]
-        query_label = self.widgets["query_label"]
         current_state = status_pill.cget("text")
 
         # UPDATED: Check for 'Listening' or other active states in the pill text.
@@ -521,17 +697,18 @@ class AssistantAlexa:
             if pygame.mixer.music.get_busy():
                 pygame.mixer.music.stop()
             status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
-            response_label.configure(text="")
-            query_label.configure(text="")
+            # The in-progress block never finished, so drop it from history
+            # entirely rather than leaving a blank/partial entry behind.
+            self._discard_current_block()
             self.root.after(100, self._reset_barge_flag_and_listen)
         else:
-            self._reset_close_timer(10)
+            self._reset_close_timer(5)
             self._activate_listening_ui(is_first=False)
 
     def _reset_barge_flag_and_listen(self):
         with self.service.state_lock:
             self.service.barge_in_triggered = False
-        self._reset_close_timer(10)
+        self._reset_close_timer(5)
         self.listening_active = False
         self._start_listening_thread(False)
 
@@ -549,7 +726,7 @@ class AssistantAlexa:
             return
         status_pill = self.widgets["status_pill"]
         status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
-        self._reset_close_timer(10)
+        self._reset_close_timer(5)
         self._start_listening_thread(is_first)
 
     def capture_initial_query(self):
@@ -654,7 +831,7 @@ class AssistantAlexa:
                         pass
                     self.close_timer_id[0] = None
             else:
-                self._reset_close_timer(10)
+                self._reset_close_timer(5)
             # Cursor is still over the dot right after the click, so keep the
             # elongated label in sync instead of waiting for the next hover.
             _pin_hover_style()
@@ -724,6 +901,22 @@ class AssistantAlexa:
         opacity_slider.set(1.0)
         opacity_slider.pack(side="left", padx=(15, 5))
 
+        # Copies every visible Q&A block (up to the last 3) at once - the
+        # per-response "⧉" button on each row only copies that one response.
+        copy_all_btn = ctk.CTkButton(
+            header,
+            text="📋",
+            width=26,
+            height=22,
+            corner_radius=5,
+            font=("Consolas", 12),
+            fg_color=theme["idle_pill_bg"],
+            hover_color=theme["slider_track"],
+            text_color=theme["idle_pill_text"],
+            command=self._copy_all_history,
+        )
+        copy_all_btn.pack(side="left", padx=(5, 0))
+
         # UPDATED: The new pill-shaped green speaker button on the far right
         # Style mapped to image: green pill, white speaker icon.
         def _sync_speaker_pill():
@@ -776,7 +969,7 @@ class AssistantAlexa:
                 self.service.stop_meeting_mode()
                 self.is_pinned = self._meeting_prev_pinned
                 if not self.is_pinned:
-                    self._reset_close_timer(10)
+                    self._reset_close_timer(5)
                 self.service.dictation_enabled = self._meeting_prev_dictation
                 pygame.mixer.music.set_volume(1.0 if self.service.dictation_enabled else 0.0)
             else:
@@ -825,35 +1018,44 @@ class AssistantAlexa:
         )
         status_pill.pack(side="right", padx=(5, 10))
 
-        # Body area for text content
-        body = ctk.CTkFrame(panel, fg_color="transparent")
+        # Body area for text content - scrollable so a long response grows a
+        # themed scrollbar instead of pushing the window past a sane height
+        # (see max_auto_height in _update_height). fg_color is pinned to the
+        # panel's own color (never "transparent") - CTkScrollableFrame
+        # resolves a "transparent" fg_color by inheriting bg_color up its
+        # own internal parent chain rather than the panel's actual color,
+        # which here lands on the root window's OS-level transparency key
+        # and punches a see-through hole showing whatever is behind the
+        # widget. Matching panel_fg exactly keeps it visually seamless with
+        # the panel behind it, same as the old plain fg_color="transparent"
+        # CTkFrame looked, without invoking that resolution path.
+        body = ctk.CTkScrollableFrame(
+            panel,
+            fg_color=theme["panel_fg"],
+            scrollbar_fg_color=theme["slider_track"],
+            scrollbar_button_color=theme["slider_button"],
+            scrollbar_button_hover_color=theme["slider_button_hover"],
+        )
         body.pack(fill="both", expand=True, padx=15, pady=(5, 10))
 
-        # Preserve dragging logic on body
+        # Preserve dragging logic on body - bound on both the content frame
+        # and its backing canvas, since the canvas is what's actually under
+        # the cursor in any empty space below short content.
         body.bind("<ButtonPress-1>", self._start_move)
         body.bind("<B1-Motion>", self._move_window)
+        body._parent_canvas.bind("<ButtonPress-1>", self._start_move)
+        body._parent_canvas.bind("<B1-Motion>", self._move_window)
 
-        # Prompt frame (user text line)
-        prompt_frame = ctk.CTkFrame(body, fg_color="transparent")
-        prompt_frame.pack(fill="x", anchor="w")
-        prompt_frame.bind("<ButtonPress-1>", self._start_move)
-        prompt_frame.bind("<B1-Motion>", self._move_window)
+        # self.widgets needs "status_pill" and "body" before the first
+        # history block can be built, since _create_qa_block() reads both.
+        self.widgets = {"status_pill": status_pill, "body": body}
+        self.history_blocks = []
+        self._create_qa_block()
 
-        # Console-style user line formatting
-        ctk.CTkLabel(prompt_frame, text=f"{self.config.user_name}:", font=("Consolas", 13, "bold"), text_color="#00FF9C").pack(side="left")
-        ctk.CTkLabel(prompt_frame, text="~", font=("Consolas", 13, "bold"), text_color="#0066FF").pack(side="left", padx=(6, 0))
-        ctk.CTkLabel(prompt_frame, text="$", font=("Consolas", 13, "bold"), text_color="#FF00FF").pack(side="left", padx=(6, 10))
-
-        query_label = ctk.CTkLabel(prompt_frame, text="", font=("Consolas", 13), text_color="#FFFFFF")
-        query_label.pack(side="left")
-
-        # Response label (typing area)
-        response_label = ctk.CTkLabel(
-            body, text="", font=("Consolas", 13), text_color="#CCCCCC", justify="left", wraplength=max(120, self.window_width - 70)
-        )
-        response_label.pack(anchor="w", pady=(10, 0))
-        response_label.bind("<ButtonPress-1>", self._start_move)
-        response_label.bind("<B1-Motion>", self._move_window)
+        # Ctrl+C anywhere while the widget is focused copies the current
+        # (latest) response, since CTkLabel offers no native text selection.
+        self.root.bind("<Control-c>", self._copy_response_text)
+        self.root.bind("<Control-C>", self._copy_response_text)
 
         # Resize grip - bottom-right corner handle the user can drag to
         # widen/lengthen the widget. Placed last so it stacks visually above
@@ -873,8 +1075,29 @@ class AssistantAlexa:
         resize_grip.bind("<ButtonPress-1>", self._start_resize)
         resize_grip.bind("<B1-Motion>", self._do_resize)
 
-        # Register widgets with updated names
-        self.widgets = {"status_pill": status_pill, "query_label": query_label, "response_label": response_label}
+        # Small centered drag handle sitting just above the header (the
+        # "functions tab") at the very top of the widget - a sleek pill
+        # (mirroring a bottom-sheet grab handle), not a full-width strip.
+        # Overlaid via place() like the resize grip, so it doesn't reserve
+        # any layout space of its own. Green in the dark theme, red in the
+        # light theme (see drag_handle_color per theme).
+        drag_handle = ctk.CTkFrame(
+            panel,
+            fg_color=theme["drag_handle_color"],
+            corner_radius=3,
+            width=48,
+            height=5,
+            cursor="fleur",
+        )
+        drag_handle.place(relx=0.5, rely=0.0, y=3, anchor="n")
+        drag_handle.bind("<ButtonPress-1>", self._start_move)
+        drag_handle.bind("<B1-Motion>", self._move_window)
+        drag_handle.bind("<Enter>", lambda e: drag_handle.configure(fg_color=self.THEMES[self.theme]["drag_handle_hover"]))
+        drag_handle.bind("<Leave>", lambda e: drag_handle.configure(fg_color=self.THEMES[self.theme]["drag_handle_color"]))
+
+        # self.widgets already carries status_pill/body/query_label/
+        # response_label (set above) - just add the header's copy-all button.
+        self.widgets["copy_all_btn"] = copy_all_btn
         self.theme_widgets = {
             "panel": panel,
             "header": header,
@@ -882,6 +1105,9 @@ class AssistantAlexa:
             "speaker_pill": speaker_pill,
             "meeting_pill": meeting_pill,
             "status_pill": status_pill,
+            "body": body,
+            "drag_handle": drag_handle,
+            "copy_all_btn": copy_all_btn,
         }
 
         # Initialize window state and processing
