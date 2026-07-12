@@ -1,12 +1,16 @@
 import ctypes
+import os
 import threading
 
 import customtkinter as ctk
+from PIL import Image
 import pygame
 import speech_recognition as sr
 
 from .AppConfig import save_theme_preference
 from .Logger import log_msg
+
+_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
 
 # GetSystemMetrics indices for the full virtual desktop (spans every
 # connected monitor, not just the primary one). Coordinates can be negative
@@ -72,10 +76,19 @@ class AssistantAlexa:
         },
     }
 
+    # Idle "Mic Off" state is a compact icon-only button (a plain mic glyph
+    # rather than a wordy pill); every other status widens back out so the
+    # state text ("Listening"/"Transcribing"/"Processing") fits.
+    STATUS_PILL_IDLE_WIDTH = 34
+    STATUS_PILL_ACTIVE_WIDTH = 95
+
     def __init__(self, service):
         self.service = service
         self.config = service.config
         self.root = None
+        mic_icon_path = os.path.join(_ASSETS_DIR, "mic_icon.png")
+        mic_icon_image = Image.open(mic_icon_path)
+        self.mic_icon = ctk.CTkImage(light_image=mic_icon_image, dark_image=mic_icon_image, size=(18, 18))
         self.window_width = 440
         self.window_height = 130
         self.min_window_width = 440
@@ -103,6 +116,10 @@ class AssistantAlexa:
         # (that's AssistantService.conversation_history, capped separately).
         # Each entry: {"prompt_frame", "query_label", "response_label", "copy_btn"}.
         self.history_blocks = []
+        # Tracks which state the status pill is in ("mic_off", "listening",
+        # "transcribing", "processing") so _apply_theme can re-color it
+        # correctly on a theme toggle without having to parse its text.
+        self.status_state = "mic_off"
         self.theme = self.config.initial_theme
         self.active_token = 0
         self.listening_active = False
@@ -326,6 +343,38 @@ class AssistantAlexa:
     def _bullet(self):
         return self.THEMES[self.theme]["bullet"]
 
+    def _set_status_pill(self, state):
+        # Single place that sets the status pill's text/width/colors for a
+        # given state, so every transition (idle, listening, transcribing,
+        # processing) looks consistent and _apply_theme can re-color
+        # whichever one is currently active without parsing button text.
+        status_pill = self.widgets.get("status_pill")
+        if not status_pill:
+            return
+        self.status_state = state
+        theme = self.THEMES[self.theme]
+        bullet = theme["bullet"]
+        if state == "mic_off":
+            status_pill.configure(
+                text="",
+                image=self.mic_icon,
+                width=self.STATUS_PILL_IDLE_WIDTH,
+                fg_color=theme["idle_pill_bg"],
+                text_color=theme["idle_pill_text"],
+            )
+        elif state == "listening":
+            status_pill.configure(
+                text=f"{bullet} Listening", image=None, width=self.STATUS_PILL_ACTIVE_WIDTH, fg_color="#FF5F56", text_color="#FFFFFF"
+            )
+        elif state == "transcribing":
+            status_pill.configure(
+                text=f"{bullet} Transcribing", image=None, width=self.STATUS_PILL_ACTIVE_WIDTH, fg_color="#FFBD2E", text_color="#000000"
+            )
+        elif state == "processing":
+            status_pill.configure(
+                text=f"{bullet} Processing", image=None, width=self.STATUS_PILL_ACTIVE_WIDTH, fg_color="#3A3A3A", text_color="#AAAAAA"
+            )
+
     def _apply_theme(self):
         # Re-colors the already-built widgets in place - never rebuilds the
         # window, so a theme toggle can't reintroduce the kind of crash a
@@ -334,7 +383,6 @@ class AssistantAlexa:
         if not w:
             return
         theme = self.THEMES[self.theme]
-        bullet = theme["bullet"]
 
         w["panel"].configure(fg_color=theme["panel_fg"], border_color=theme["panel_border"])
         w["header"].configure(fg_color=theme["header_fg"])
@@ -355,17 +403,8 @@ class AssistantAlexa:
         for block in self.history_blocks:
             block["copy_btn"].configure(hover_color=theme["idle_pill_bg"], text_color=theme["idle_pill_text"])
 
-        status_pill = w["status_pill"]
-        status_pill.configure(corner_radius=theme["status_corner_radius"], height=theme["status_height"])
-        current_text = status_pill.cget("text")
-        if current_text.endswith("Mic Off"):
-            status_pill.configure(text=f"{bullet} Mic Off", fg_color=theme["idle_pill_bg"], text_color=theme["idle_pill_text"])
-        elif current_text.endswith("Processing"):
-            status_pill.configure(text=f"{bullet} Processing")
-        elif current_text.endswith("Transcribing"):
-            status_pill.configure(text=f"{bullet} Transcribing")
-        elif current_text.endswith("Listening"):
-            status_pill.configure(text=f"{bullet} Listening")
+        w["status_pill"].configure(corner_radius=theme["status_corner_radius"], height=theme["status_height"])
+        self._set_status_pill(self.status_state)
 
         speaker_pill = w["speaker_pill"]
         speaker_pill.configure(font=(theme["dictation_font"], 14))
@@ -499,19 +538,18 @@ class AssistantAlexa:
             return self.service.transcribe_audio(audio_capture)
 
     def _end_listening_stage(self):
-        # Ends just the listening/transcribing attempt. While pinned, the
-        # widget itself must stay open - revert to an idle mic state instead
-        # of closing, so the user can click the mic pill again to re-listen.
-        # Nothing was heard, so no new history block was ever created here -
-        # the last completed exchange stays exactly as it is.
+        # Ends just the listening/transcribing attempt - nothing was heard,
+        # so no new history block was ever created here and the chat stays
+        # exactly as it is. Always revert to an idle mic state rather than
+        # closing outright: closing immediately when unpinned used to wipe
+        # the *entire* visible chat the instant one follow-up attempt came
+        # up empty (e.g. the user clicked the mic and didn't say anything
+        # clear). Reverting to idle and re-arming the normal unpin timeout
+        # instead means the chat stays visible until that timeout actually
+        # elapses, same as after any other response.
         self.listening_active = False
-        if self.is_pinned:
-            theme = self.THEMES[self.theme]
-            status_pill = self.widgets.get("status_pill")
-            if status_pill:
-                status_pill.configure(text=f"{self._bullet()} Mic Off", fg_color=theme["idle_pill_bg"], text_color=theme["idle_pill_text"])
-        else:
-            self._safe_close()
+        self._set_status_pill("mic_off")
+        self._reset_close_timer()
 
     def _process_queue_events(self):
         while not self.service.widget_command_queue.empty():
@@ -542,14 +580,12 @@ class AssistantAlexa:
         def is_stale():
             return token != self.active_token or self.service.barge_in_triggered
 
-        status_pill = self.widgets["status_pill"]
         # A fresh, blank row appended to the scrollable history rather than
         # reusing the previous turn's labels - keeps every exchange from
         # this session visible instead of each new answer overwriting the last.
         query_label, response_label = self._create_qa_block()
 
-        # UPDATED: Use the new status pill and image dot notation
-        self._safe_gui(status_pill.configure, text=f"{self._bullet()} Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
+        self._safe_gui(self._set_status_pill, "processing")
 
         if not is_followup and self.config.greet_user:
             a_str = f"Hey {self.config.user_name}, {a_str}"
@@ -566,8 +602,7 @@ class AssistantAlexa:
         def activate_listening_ui(is_first=False):
             if is_stale():
                 return
-            # UPDATED: Style change for the status pill
-            status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
+            self._set_status_pill("listening")
             self._reset_close_timer()
             self._start_listening_thread(is_first)
 
@@ -651,13 +686,11 @@ class AssistantAlexa:
             type_query()
 
     def _listen_for_followup(self, is_first=False):
-        status_pill = self.widgets["status_pill"]
         # Pinned sessions get a slightly longer listening window since the
         # user has explicitly signalled they intend to keep talking.
         listen_timeout = 6 if self.is_pinned else 5
         try:
-            # UPDATED: Style change for the status pill
-            self._safe_gui(status_pill.configure, text=f"{self._bullet()} Transcribing", fg_color="#FFBD2E", text_color="#000000")
+            self._safe_gui(self._set_status_pill, "transcribing")
             followup_q = self._transcribe_followup(timeout=listen_timeout)
             log_msg(f"Heard: '{followup_q}'", "INFO")
 
@@ -665,7 +698,7 @@ class AssistantAlexa:
                 # The new query/answer gets its own block via _run_sequence
                 # below - nothing to clear on the previous (still valid,
                 # still-displayed) history entry here.
-                self._safe_gui(status_pill.configure, text=f"{self._bullet()} Processing", fg_color="#3A3A3A", text_color="#AAAAAA")
+                self._safe_gui(self._set_status_pill, "processing")
                 try:
                     answer = self.service.process_query_master(followup_q)
                     if not self.service.barge_in_triggered:
@@ -702,7 +735,7 @@ class AssistantAlexa:
             self.active_token += 1
             if pygame.mixer.music.get_busy():
                 pygame.mixer.music.stop()
-            status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
+            self._set_status_pill("listening")
             # The in-progress block never finished, so drop it from history
             # entirely rather than leaving a blank/partial entry behind.
             self._discard_current_block()
@@ -730,8 +763,7 @@ class AssistantAlexa:
     def _activate_listening_ui(self, is_first=False):
         if self.service.barge_in_triggered:
             return
-        status_pill = self.widgets["status_pill"]
-        status_pill.configure(text=f"{self._bullet()} Listening", fg_color="#FF5F56", text_color="#FFFFFF")
+        self._set_status_pill("listening")
         self._reset_close_timer()
         self._start_listening_thread(is_first)
 
@@ -1011,18 +1043,19 @@ class AssistantAlexa:
         meeting_pill.pack(side="right", padx=(5, 5))
         _sync_meeting_pill()
 
-        # UPDATED: Pill-shaped status button (replacing mic_btn) with text "• Mic Off"
-        # Style mapped to image: dark, pill shape. targeted by statuses like Processing.
-        # uses the specific dot '•' notation.
+        # Pill-shaped status button. Idle state is a compact mic icon;
+        # Listening/Transcribing/Processing widen it out to show text (see
+        # _set_status_pill).
         status_pill = ctk.CTkButton(
             header,
-            text=f"{theme['bullet']} Mic Off",
+            text="",
+            image=self.mic_icon,
             font=("Consolas", 11, "bold"),
             text_color=theme["idle_pill_text"],
             fg_color=theme["idle_pill_bg"],
             hover_color="#444444",
             corner_radius=theme["status_corner_radius"],
-            width=95,
+            width=self.STATUS_PILL_IDLE_WIDTH,
             height=theme["status_height"],
             command=self._trigger_followup_or_interrupt,
         )
