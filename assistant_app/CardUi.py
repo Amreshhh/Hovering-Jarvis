@@ -95,11 +95,14 @@ class AssistantAlexa:
         self.close_timer_id = [None]
         self.widgets = {}
         self.theme_widgets = {}
-        # Up to the last 3 question/answer exchanges, kept visible in the
-        # scrollable body instead of each new answer replacing the last.
+        # Every question/answer exchange for the current open session, kept
+        # visible in the scrollable body instead of each new answer
+        # replacing the last. Cleared whenever the widget actually closes
+        # (see _safe_close), so a fresh open always starts with an empty
+        # chat box - it's a display list, not the LLM's conversation memory
+        # (that's AssistantService.conversation_history, capped separately).
         # Each entry: {"prompt_frame", "query_label", "response_label", "copy_btn"}.
         self.history_blocks = []
-        self.max_history_blocks = 3
         self.theme = self.config.initial_theme
         self.active_token = 0
         self.listening_active = False
@@ -301,7 +304,7 @@ class AssistantAlexa:
         self._copy_text_from_label(self.widgets.get("response_label"))
 
     def _copy_all_history(self):
-        # Copies all currently visible Q&A blocks (up to the last 3), not
+        # Copies every currently visible Q&A block from this session, not
         # just the latest one - the header's "copy everything" action.
         parts = []
         for block in self.history_blocks:
@@ -391,12 +394,16 @@ class AssistantAlexa:
     def _create_qa_block(self):
         # Appends a fresh, blank query/response row to the scrollable
         # history instead of reusing a single pair of labels - this is what
-        # lets the last few exchanges stay visible instead of each new
-        # answer replacing the last. Oldest block is evicted once the cap
-        # is exceeded. Returns (query_label, response_label) for the new
-        # block and also registers them as the "current" ones in
-        # self.widgets, since most of the sequencing code just wants
-        # whatever the latest block is.
+        # lets earlier exchanges stay visible instead of each new answer
+        # replacing the last. The chat box keeps every exchange for as long
+        # as this window stays open (closing - e.g. after unpinning and
+        # timing out - always clears history_blocks, so the next open
+        # starts fresh). This is purely a display list; the LLM only ever
+        # gets the last few exchanges for context, via the separate,
+        # independently-capped AssistantService.conversation_history.
+        # Returns (query_label, response_label) for the new block and also
+        # registers them as the "current" ones in self.widgets, since most
+        # of the sequencing code just wants whatever the latest block is.
         body = self.widgets["body"]
         theme = self.THEMES[self.theme]
 
@@ -438,10 +445,6 @@ class AssistantAlexa:
 
         block = {"prompt_frame": prompt_frame, "query_label": query_label, "response_label": response_label, "copy_btn": copy_btn}
         self.history_blocks.append(block)
-        if len(self.history_blocks) > self.max_history_blocks:
-            oldest = self.history_blocks.pop(0)
-            oldest["prompt_frame"].destroy()
-            oldest["response_label"].destroy()
 
         self.widgets["query_label"] = query_label
         self.widgets["response_label"] = response_label
@@ -541,8 +544,8 @@ class AssistantAlexa:
 
         status_pill = self.widgets["status_pill"]
         # A fresh, blank row appended to the scrollable history rather than
-        # reusing the previous turn's labels - keeps the last few exchanges
-        # visible instead of each new answer overwriting the last.
+        # reusing the previous turn's labels - keeps every exchange from
+        # this session visible instead of each new answer overwriting the last.
         query_label, response_label = self._create_qa_block()
 
         # UPDATED: Use the new status pill and image dot notation
@@ -908,7 +911,7 @@ class AssistantAlexa:
         opacity_slider.set(1.0)
         opacity_slider.pack(side="left", padx=(15, 5))
 
-        # Copies every visible Q&A block (up to the last 3) at once - the
+        # Copies every visible Q&A block from this session at once - the
         # per-response "⧉" button on each row only copies that one response.
         copy_all_btn = ctk.CTkButton(
             header,

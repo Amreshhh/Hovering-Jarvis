@@ -23,7 +23,7 @@ The project is split into small modules so the UI, runtime loop, configuration, 
 - Online response routing with fallback behavior for simple definition-style queries.
 - Alexa controls for theme switching, pinning, closing, opacity adjustment, and audio mute/unmute.
 - Meeting mode: listens to the PC's own system/loopback audio (e.g. a Zoom or Teams call) instead of the microphone, transcribes what's said, and types the answer in the widget - handy for getting live answers to questions asked in a meeting.
-- Chat history: the last 3 questions and answers stay on screen in a scrollable list, so you don't lose the earlier ones when you ask something new.
+- Chat history: every question and answer from the current session stays on screen in a scrollable list, so you don't lose the earlier ones when you ask something new. Closing the widget (e.g. after unpinning and it times out) clears it, so the next time you call Alexa you get a fresh chat box.
 - Copy buttons: grab a single answer or the whole visible conversation with one click.
 - A small drag handle above the toolbar for moving the window around.
 
@@ -57,17 +57,18 @@ Left to right, this is what's in the toolbar:
 - 🟡 Yellow button: pins or unpins the Alexa so it stays open.
 - 🔴 Red button: closes the window.
 - Opacity slider: adjusts how see-through the window is.
-- 📋 Copy-all button: copies the whole visible conversation (up to the last 3 questions and answers) to the clipboard in one click.
+- 📋 Copy-all button: copies the whole visible conversation from the current session to the clipboard in one click.
 - 🖥 Meeting-mode button: toggles listening to the PC's system audio (loopback) instead of the mic. While active, the Alexa is auto-pinned open and its own TTS is muted, so it just types out answers to whatever it hears in the call. Requires Windows with a WASAPI loopback device (`PyAudioWPatch`); the button is greyed out if unavailable.
 - Speaker button: mutes or unmutes assistant audio playback.
 - Status pill: shows what the assistant is doing right now (Mic Off, Listening, Transcribing, Processing). Click it while the assistant is processing or transcribing to barge in and interrupt the current response.
 
 ### Response area
 
-- Keeps the last 3 questions and their answers on screen instead of wiping out the previous one - just scroll up to see what was asked before.
+- Keeps every question and answer from the current session on screen instead of wiping out the previous one - just scroll up to see what was asked before. This resets once the widget closes, so calling Alexa again starts a clean chat box.
 - A scrollbar shows up when the conversation gets longer than the window, styled to match whichever theme is active.
 - ⧉ Copy button: each answer has its own small copy button next to its question, so you can grab just that one answer.
 - You can also right-click an answer, or press Ctrl+C, to copy the most recent one.
+- Behind the scenes, Alexa only feeds itself the last 3 exchanges as conversation context when talking to the API - the chat box can show more than that, but older messages don't count toward what it "remembers".
 
 ## Setup
 
